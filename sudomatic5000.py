@@ -276,6 +276,27 @@ def _get_utc_datetime() -> datetime:
 def _parse_iso_datetime(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
 
+def _pickSourceGroupName(upn: str, groups: list[dict]) -> str | None:
+    """Return the first Graph group displayName that contains this UPN (case-insensitive)."""
+    upn_l = upn.lower()
+    for g in groups or []:
+        # expect structure from your fncGraphListManyGroups: g["name"], g["members"] = [(upn_orig, enabled, meta_dict), ...]
+        for (member_upn, _enabled, _meta) in g.get("members", []):
+            if (member_upn or "").lower() == upn_l:
+                return g.get("name") or g.get("id") or None
+    return None
+
+def _lookupUserMeta(upn: str, groups: list[dict]) -> dict:
+    """Find Graph metadata for a user across your collected groups (givenName, surname, mail, displayName)."""
+    upn_l = upn.lower()
+    for g in groups or []:
+        for (member_upn, _enabled, meta) in g.get("members", []):
+            if (member_upn or "").lower() == upn_l and isinstance(meta, dict):
+                return meta
+    return {}
+
+
+
 #===========================#
 # Apply Environment Overrides
 #===========================#
@@ -460,6 +481,34 @@ def fncUpnToUnix(upn: str) -> str:
     left = left.replace(".", "_")
     left = re.sub(r"[^a-z0-9._-]", "_", left)
     return left[:USERNAME_MAXLEN]
+
+def fncPveUserModify(upn: str,
+                     email: str | None = None,
+                     comment: str | None = None,
+                     firstname: str | None = None,
+                     lastname: str | None = None) -> bool:
+    """
+    Update PVE user metadata (email/comment/firstname/lastname). No-op if nothing passed.
+    """
+    args = ["user", "modify", fncPveUseridFromUpn(upn)]
+    if email:
+        args += ["-email", email]
+    if comment:
+        args += ["-comment", comment]
+    if firstname:
+        args += ["-firstname", firstname]
+    if lastname:
+        args += ["-lastname", lastname]
+
+    if len(args) == 3:  # nothing to change
+        return False
+
+    rc, _, err = fncRun("pveum", args)
+    if rc != 0:
+        logging.error("PVE user modify failed for %s: %s", upn, err)
+        return False
+    logging.info("PVE user metadata updated: %s (email=%s comment=%s)", upn, bool(email), bool(comment))
+    return True
 
 # Function: fncRun
 # Purpose : Execute a pinned binary by logical key; capture rc/stdout/stderr.
@@ -789,17 +838,40 @@ def fncPveUserExists(userid: str) -> bool:
 # Function: fncPveEnsureUser
 # Purpose : Ensure a PVE user exists and is enabled/disabled as requested.
 # Notes   : Adds if missing; otherwise delegates to fncPveUserSetEnabled.
-def fncPveEnsureUser(upn: str, enabled: bool = True) -> bool:
-    userid = fncPveUseridFromUpn(upn)
+# Function: fncPveEnsureUser
+# Purpose : Ensure a PVE user exists, set enable, and update optional metadata.
+# Notes   : Keeps UPN case for PVE user id; unix login stays lowercase elsewhere.
+def fncPveEnsureUser(upn: str,
+                     enabled: bool = True,
+                     email: str | None = None,
+                     comment: str | None = None,
+                     firstname: str | None = None,
+                     lastname: str | None = None) -> bool:
+    userid = fncPveUseridFromUpn(upn)  # preserves case in UPN
+
     if not fncPveUserExists(userid):
         args = ["user", "add", userid, "-enable", "1" if enabled else "0"]
+        if email:
+            args += ["-email", email]
+        if comment:
+            args += ["-comment", comment]
+        if firstname:
+            args += ["-firstname", firstname]
+        if lastname:
+            args += ["-lastname", lastname]
+
         rc, _, err = fncRun("pveum", args)
         if rc != 0:
             logging.error("PVE user add failed for %s: %s", userid, err)
             return False
         logging.info("PVE user created: %s (enable=%s)", userid, int(enabled))
         return True
-    return fncPveUserSetEnabled(upn, enabled)
+
+    # Existing user: ensure enabled flag, then update metadata if provided
+    changed = fncPveUserSetEnabled(upn, enabled)
+    meta_changed = fncPveUserModify(upn, email=email, comment=comment,
+                                    firstname=firstname, lastname=lastname)
+    return changed or meta_changed
 
 # Function: fncPveUserSetEnabled
 # Purpose : Toggle a PVE users enabled flag if needed.
@@ -1254,21 +1326,41 @@ def fncSync():
 
         if not entra_enabled:
             # Entra account disabled but still in groups → disable locally (no delete countdown)
-            fncPveUserSetEnabled(upn, enabled=False)
             fncLockUser(user)
             if user not in disabled:
                 disabled[user] = _get_utc_datetime().isoformat()
             upn = unix_to_upn.get(user)   # original case for PVE
             is_superadmin = (upn and upn.lower() in in_superadmin_ci)
             # ...
+        
             if upn:
-                fncPveEnsureUser(upn, enabled=True)               # uses original case
-                roles = set(user_roles_by_upn.get(upn, set()))
-                # add baseline role if desired
-                if (upn.lower() in in_allusers_ci) and ENTRA_ALLUSERS_PVE_ROLE and not roles:
-                    roles = {ENTRA_ALLUSERS_PVE_ROLE}
-                if roles:
-                    fncPveEnsureAclRoles(fncPveUseridFromUpn(upn), roles, path="/")  # upn in original case
+                # Build comment + pull meta from the Graph groups snapshot
+                src_label = _pickSourceGroupName(upn, groups)
+                meta = _lookupUserMeta(upn, groups)
+                comment = f"Synced from Entra via {src_label} Group" if src_label else None
+
+                try:
+                    fncPveEnsureUser(
+                        upn,
+                        enabled=True,
+                        email=meta.get("mail"),
+                        comment=comment,
+                        firstname=meta.get("givenName"),
+                        lastname=meta.get("surname"),
+                    )
+
+                    # Then assign roles as you already do
+                    roles = set(user_roles_by_upn.get(upn, set()))
+
+                    # Make AllUsers additive if you want:
+                    if (upn in in_allusers_upn) and ENTRA_ALLUSERS_PVE_ROLE and not roles:
+                        roles = {ENTRA_ALLUSERS_PVE_ROLE}
+
+                    if roles:
+                        fncPveEnsureAclRoles(fncPveUseridFromUpn(upn), roles, path="/")
+
+                except Exception as e:
+                    logging.error("PVE provisioning failed for %s: %s", upn, e)
 
             fncRemoveSudoers(user)
             fncRemoveUserFromGroup(user, "sudo")
