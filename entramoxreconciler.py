@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Script: sudomatic5000.py
+# Script: entramoxreconciler.py
 # Developed by Dean with a bit of love and Irn Bru
 #
 # What this does (for my future self):
@@ -8,7 +8,7 @@
 # - Create local users if missing, set a random password, and expire it immediately 
 # - Add groups + per-user sudoers (only writes if needed)
 # - If a user disappears from the realm: lock them, then delete after 24h
-# - Logs to /var/log/sudomatic5000/thelog.log
+# - Logs to /var/log/entramoxreconciler/thelog.log
 
 # ==============================
 # Imports
@@ -50,8 +50,8 @@ EXTRA_GROUPS = ["sudo"]             # Supplementary groups (tip: set [] if sudo 
 GRANT_SUDO = False                  # Per-user sudoers in /etc/sudoers.d
 SUDO_NOPASSWD = False               # False = require password for sudo
 
-LOG_FILE = "/var/log/sudomatic5000/thelog.log"
-STATE_DIR = "/var/lib/sudomatic5000/pve_oidc_sync"
+LOG_FILE = "/var/log/entramoxreconciler/thelog.log"
+STATE_DIR = "/var/lib/entramoxreconciler/pve_oidc_sync"
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 LOCK_PATH  = os.path.join(STATE_DIR, ".lock")
 MANAGED_SUDOERS_PREFIX = "/etc/sudoers.d/pve_realm-"
@@ -135,7 +135,7 @@ def fncAcquireLock():
         fcntl.lockf(_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
         logging.debug("Acquired lock: %s", LOCK_PATH)
     except BlockingIOError:
-        fncPrintMessage("Another instance of sudomatic5000 is already running.", "warning")
+        fncPrintMessage("Another instance of entramoxreconciler is already running.", "warning")
         sys.exit(1)
     except Exception as e:
         fncPrintMessage(f"Failed to acquire lock ({LOCK_PATH}): {e}", "error")
@@ -278,23 +278,131 @@ def _parse_iso_datetime(ts: str) -> datetime:
 
 def _pickSourceGroupName(upn: str, groups: list[dict]) -> str | None:
     """Return the first Graph group displayName that contains this UPN (case-insensitive)."""
-    upn_l = upn.lower()
+    upn_l = (upn or "").strip().lower()
+    if not upn_l:
+        return None
+
     for g in groups or []:
-        # expect structure from your fncGraphListManyGroups: g["name"], g["members"] = [(upn_orig, enabled, meta_dict), ...]
-        for (member_upn, _enabled, _meta) in g.get("members", []):
-            if (member_upn or "").lower() == upn_l:
-                return g.get("name") or g.get("id") or None
+        members = g.get("members") or []
+        if not isinstance(members, list):
+            continue
+
+        for row in members:
+            if not isinstance(row, (list, tuple)) or not row:
+                continue
+            member_upn = (row[0] or "").strip().lower()
+            if member_upn == upn_l:
+                return (g.get("name") or g.get("id") or None)
+
     return None
 
 def _lookupUserMeta(upn: str, groups: list[dict]) -> dict:
-    """Find Graph metadata for a user across your collected groups (givenName, surname, mail, displayName)."""
-    upn_l = upn.lower()
-    for g in groups or []:
-        for (member_upn, _enabled, meta) in g.get("members", []):
-            if (member_upn or "").lower() == upn_l and isinstance(meta, dict):
-                return meta
-    return {}
+    """
+    Merge metadata for a user across groups; prefer non-empty fields.
+    Expected meta keys: givenName, surname, mail, displayName (but we don't enforce).
+    """
+    upn_l = (upn or "").strip().lower()
+    if not upn_l:
+        return {}
 
+    best: dict = {}
+
+    def _prefer(dst: dict, src: dict):
+        # Copy any key that is missing/blank in dst but present in src
+        for k, v in (src or {}).items():
+            if v is None:
+                continue
+            if isinstance(v, str):
+                if not v.strip():
+                    continue
+                if not str(dst.get(k, "")).strip():
+                    dst[k] = v
+            else:
+                if k not in dst:
+                    dst[k] = v
+
+    for g in groups or []:
+        members = g.get("members") or []
+        if not isinstance(members, list):
+            continue
+
+        for row in members:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+
+            member_upn = (row[0] or "").strip().lower()
+            meta = row[2]
+            if member_upn == upn_l and isinstance(meta, dict):
+                _prefer(best, meta)
+
+                # fast exit if we already have the main fields
+                if all(str(best.get(k, "")).strip() for k in ("mail", "givenName", "surname", "displayName")):
+                    return best
+
+    return best
+
+def _graphFailOrWarn(message: str):
+    """
+    Enforce GRAPH_FAIL_OPEN policy.
+    If fail-open: warn and continue.
+    If fail-closed: log + print and exit non-zero.
+    """
+    if GRAPH_FAIL_OPEN:
+        logging.warning(message)
+        fncPrintMessage(message, "warning")
+        return
+
+    logging.error(message)
+    fncPrintMessage(message, "error")
+    sys.exit(2)
+
+def _buildPveMetaForUpn(upn: str, groups: list[dict]) -> tuple[dict, str]:
+    """
+    Return (meta_dict, comment_str) for a UPN using Graph group data.
+    """
+    src_label = None
+    meta = {}
+
+    try:
+        src_label = _pickSourceGroupName(upn, groups) if groups else None
+        meta = _lookupUserMeta(upn, groups) if groups else {}
+    except Exception as e:
+        logging.debug("Metadata lookup failed for %s: %s", upn, e)
+
+    comment = f"Synced from Entra via {src_label} Group" if src_label else "Synced from Entra"
+    return meta, comment
+
+def _format_remaining(td: timedelta) -> str:
+    """
+    Format a timedelta as 'Xh Ym'.
+    Floors minutes; never shows negatives.
+    """
+    total_seconds = max(0, int(td.total_seconds()))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, _ = divmod(rem, 60)
+    return f"{hours}h {minutes}m"
+
+def _setPveDeletionComment(user: str, locked_at: datetime, unix_to_upn: dict[str, str], src_label: str | None):
+    upn = unix_to_upn.get(user) or fncResolveUpnForUnix(user)
+    if not upn:
+        logging.debug("Cannot set deletion comment; no UPN for %s", user)
+        return
+
+    now = _get_utc_datetime()
+    remaining = DELETE_AFTER - (now - locked_at)
+    remaining_str = _format_remaining(remaining)
+
+    group_part = f"{src_label} Group" if src_label else "Entra allow-groups"
+
+    comment = (
+        f"User no longer in {group_part} – "
+        f"marked for deletion in {remaining_str}"
+    )
+
+    try:
+        fncPveUserModify(upn, comment=comment)
+    except Exception as e:
+        logging.error("Failed to set deletion comment for %s: %s", upn, e)
 
 
 #===========================#
@@ -395,7 +503,7 @@ def fncBootstrapPaths():
 # Purpose : Drop a logrotate file so the log doesn't grow to wales.
 # Notes   : Creates once; ignores errors (warns only).
 def fncEnsureLogrotate():
-    path = "/etc/logrotate.d/sudomatic5000"
+    path = "/etc/logrotate.d/entramoxreconciler"
     content = f"""{LOG_FILE} {{
   weekly
   rotate 8
@@ -475,12 +583,33 @@ def fncSanitiseUnix(name: str) -> str:
 # Purpose : Map a UPN (user@domain) to the Unix login format you want.
 # Notes   : Supports "useronly" or "upn_concat" modes via USERNAME_MODE/USERNAME_SEPARATOR.
 def fncUpnToUnix(upn: str) -> str:
-    # username part only (left of @) → lowercase, safe chars
-    left = upn.split("@", 1)[0]
-    left = left.lower()                     # <= keep unix lowercase always
-    left = left.replace(".", "_")
-    left = re.sub(r"[^a-z0-9._-]", "_", left)
-    return left[:USERNAME_MAXLEN]
+    """
+    Map a UPN (user@domain) to the Unix login format you want.
+    Modes:
+      - useronly   : "user@domain"      -> "user"
+      - upn_concat : "user@domain"      -> "user<sep>domain"
+    """
+    upn = (upn or "").strip()
+    if not upn:
+        return ""
+
+    if "@" not in upn:
+        # Not a UPN; just sanitise as-is
+        return fncSanitiseUnix(upn)
+
+    user, dom = upn.split("@", 1)
+    user = user.strip()
+    dom  = dom.strip()
+
+    mode = (USERNAME_MODE or "useronly").strip().lower()
+
+    if mode == "upn_concat":
+        sep = USERNAME_SEPARATOR if USERNAME_SEPARATOR else "_"
+        raw = f"{user}{sep}{dom}"
+        return fncSanitiseUnix(raw)
+
+    # default: useronly
+    return fncSanitiseUnix(user)
 
 def fncPveUserModify(upn: str,
                      email: str | None = None,
@@ -491,13 +620,13 @@ def fncPveUserModify(upn: str,
     Update PVE user metadata (email/comment/firstname/lastname). No-op if nothing passed.
     """
     args = ["user", "modify", fncPveUseridFromUpn(upn)]
-    if email:
+    if email is not None:
         args += ["-email", email]
     if comment:
         args += ["-comment", comment]
-    if firstname:
+    if firstname is not None:
         args += ["-firstname", firstname]
-    if lastname:
+    if lastname is not None:
         args += ["-lastname", lastname]
 
     if len(args) == 3:  # nothing to change
@@ -557,6 +686,47 @@ def fncGetPveUsersForRealm(realm: str) -> set[str]:
             if unix:
                 wanted.add(unix)
     return wanted
+
+def fncGetAllPveUsersForRealm(realm: str) -> set[str]:
+    """
+    List ALL PVE users in REALM (enabled or disabled), filter by allowed UPN domains, map to unix.
+    """
+    rc, out, err = fncRun("pvesh", ["get", "/access/users", "--output-format", "json"])
+    if rc != 0:
+        logging.error("pvesh failed: %s", err)
+        return set()
+
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as e:
+        logging.error("Bad JSON from pvesh: %s", e)
+        return set()
+
+    wanted = set()
+    for u in data:
+        userid = u.get("userid", "")
+        if "@" not in userid:
+            continue
+        try:
+            upn, user_realm = userid.rsplit("@", 1)
+        except ValueError:
+            continue
+
+        if user_realm != realm or not upn:
+            continue
+
+        dom_ok = True
+        if "@" in upn:
+            dom_ok = _allowed_domain(upn.split("@", 1)[1])
+        if not dom_ok:
+            continue
+
+        unix = fncUpnToUnix(upn)
+        if unix:
+            wanted.add(unix)
+
+    return wanted
+
 
 # Function: fncEnsureGroup
 # Purpose : Ensure a Unix group exists (create if missing).
@@ -738,7 +908,7 @@ def fncGrantSudo(user: str) -> bool:
         return False
 
     d = os.path.dirname(path)
-    fd, tmp = tempfile.mkstemp(prefix=".sudomatic-", dir=d)
+    fd, tmp = tempfile.mkstemp(prefix=".entramoxreconciler-", dir=d)
     try:
         os.write(fd, expected.encode())
         os.fsync(fd)
@@ -810,10 +980,6 @@ def fncSaveState(state: dict):
     data = json.dumps(state, indent=2)
     _safe_write_atomic(STATE_PATH, data, 0o600)
 
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, STATE_PATH)
 
 # Function: fncPveUseridFromUpn
 # Purpose : Build PVE userid ("<upn>@<REALM>") for the configured realm.
@@ -922,7 +1088,7 @@ def fncPveEnsureAclRoles(userid: str, roles: set[str], path: str = "/") -> None:
 #==============================================================#
 # Function: fncGetGraphClientSecret
 # Purpose : Resolve MS Entra client secret from env (plaintext or Fernet-encrypted).
-# Notes   : Supports ENTR_CLNT_SEC (plain) or ENTR_CLNT_SEC_ENC="fernet:<token>" with SUDOMATIC_ENC_KEY.
+# Notes   : Supports ENTR_CLNT_SEC (plain) or ENTR_CLNT_SEC_ENC="fernet:<token>" with ENTRAMOX_ENC_KEY.
 def fncGetGraphClientSecret() -> str | None:
     from cryptography.fernet import Fernet
 
@@ -932,9 +1098,9 @@ def fncGetGraphClientSecret() -> str | None:
     
     enc = os.getenv("ENTR_CLNT_SEC_ENC", "").strip()
     if enc.startswith("fernet:"):
-        key_b64 = os.getenv("SUDOMATIC_ENC_KEY", "").strip()
+        key_b64 = os.getenv("ENTRAMOX_ENC_KEY", "").strip()
         if not key_b64:
-            logging.error("Missing SUDOMATIC_ENC_KEY for decrypting ENTR_CLNT_SEC_ENC")
+            logging.error("Missing ENTRAMOX_ENC_KEY for decrypting ENTR_CLNT_SEC_ENC")
             return None
         try:
             token = enc.split(":", 1)[1]
@@ -1072,7 +1238,7 @@ def fncGraphGetGroupMeta(group_id: str, token: str) -> tuple[str, str]:
 # Function: fncGraphListGroupUPNs
 # Purpose : List user members of a group with enabled flag.
 # Notes   : Returns [(upn_lower, accountEnabled_bool)] or None on fail-open.
-def fncGraphListGroupUPNs(group_id: str, token: str) -> list[tuple[str, bool]] | None:
+def fncGraphListGroupUPNs(group_id: str, token: str) -> list[tuple[str, bool, dict]] | None:
     if not token:
         _graph_print_error("InvalidAuthenticationToken", "No access token provided.", None, None)
         logging.warning("Graph: no token; proceeding without enforcement (fail-open).")
@@ -1083,10 +1249,10 @@ def fncGraphListGroupUPNs(group_id: str, token: str) -> list[tuple[str, bool]] |
     url = (
         f"https://graph.microsoft.com/v1.0/groups/{group_id}"
         f"/members/microsoft.graph.user"
-        f"?$select=id,displayName,userPrincipalName,accountEnabled&$top=999"
+        f"?$select=id,displayName,userPrincipalName,accountEnabled,givenName,surname,mail&$top=999"
     )
 
-    rows: list[tuple[str, bool]] = []
+    rows: list[tuple[str, bool, dict]] = []
     allowed_domains = {d.strip().lower() for d in ALLOWED_UPN_DOMAINS if d and d.strip()}
 
     while url:
@@ -1106,7 +1272,14 @@ def fncGraphListGroupUPNs(group_id: str, token: str) -> list[tuple[str, bool]] |
                     continue
 
             enabled = bool(item.get("accountEnabled", True))
-            rows.append((upn_orig, enabled))
+            meta = {
+                "displayName": item.get("displayName") or "",
+                "givenName": item.get("givenName") or "",
+                "surname": item.get("surname") or "",
+                "mail": item.get("mail") or "",
+                "id": item.get("id") or "",
+            }
+            rows.append((upn_orig, enabled, meta))
 
         url = doc.get("@odata.nextLink")
 
@@ -1122,21 +1295,26 @@ def fncGraphFetchGroup(group_id: str, token: str, role_map: dict[str, str] | Non
         _log_group_members(name, "members (FAIL-OPEN)", None)
         return None
 
-    upns = {u for (u, _) in rows}
+    members = rows  # [(upn_orig, enabled, meta), ...]
+
+    upns = {u for (u, _, _) in members}
     _log_group_members(name, "members", upns)
+
     unix = {fncUpnToUnix(u) for u in upns}
-    upn_enabled_map = {u: en for (u, en) in rows}
+    upn_enabled_map = {u: en for (u, en, _) in members}
     pve_role = (role_map or {}).get(group_id, "")
 
     return {
         "id": group_id,
         "name": name,
         "mail": mail,
+        "members": members,
         "upns": upns,
         "unix": unix,
         "pve_role": pve_role,
         "upn_enabled": upn_enabled_map,
     }
+
 
 # Function: fncGraphListManyGroups
 # Purpose : Fetch multiple groups with role mapping applied.
@@ -1175,7 +1353,14 @@ def fncPrintGroupReport(groups: list[dict]):
 # Function: _computeDesiredFromGraph
 # Purpose : Build the "desired" unix user set and helper maps from fetched Graph groups.
 # Notes   : Returns tuple(desired_unix, user_roles_by_upn, unix_to_upn, upn_enabled_map, in_allusers_upn, in_superadmin_upn).
-def _computeDesiredFromGraph(groups: list[dict]) -> tuple[set[str], dict[str, set[str]], dict[str, str], dict[str, bool], set[str], set[str]]:
+def _computeDesiredFromGraph(groups: list[dict]) -> tuple[
+    set[str],
+    dict[str, set[str]],
+    dict[str, str],
+    dict[str, bool],
+    set[str],
+    set[str]
+]:
     desired: set[str] = set()
     user_roles_by_upn: dict[str, set[str]] = {}
     unix_to_upn: dict[str, str] = {}
@@ -1183,30 +1368,31 @@ def _computeDesiredFromGraph(groups: list[dict]) -> tuple[set[str], dict[str, se
     in_allusers_upn: set[str] = set()
     in_superadmin_upn: set[str] = set()
 
+    allusers_enabled = bool(ENTRA_ALLUSERS_GROUP_ID.strip())
+    superadmin_enabled = bool(ENTRA_SUPERADMIN_GROUP_ID.strip())
+
     for g in groups or []:
-        # Desired unix users is the union of all group unix members
         desired |= set(g.get("unix", set()))
 
-        # Track enabled flags (if any). If a UPN appears in multiple groups, we AND the flags.
         for upn, en in (g.get("upn_enabled") or {}).items():
             upn_enabled_global[upn] = (upn_enabled_global.get(upn, True) and bool(en))
 
-        # Accumulate roles per UPN (only for groups with a mapped role)
         role = (g.get("pve_role") or "").strip()
         for upn in g.get("upns", []):
             if role:
                 user_roles_by_upn.setdefault(upn, set()).add(role)
-            # map unix back to a representative UPN
             ux = fncUpnToUnix(upn)
             unix_to_upn.setdefault(ux, upn)
 
-        # Track special groups
-        if ENTRA_ALLUSERS_GROUP_ID and g.get("id") == ENTRA_ALLUSERS_GROUP_ID:
+        # Only track special groups if configured
+        if allusers_enabled and g.get("id") == ENTRA_ALLUSERS_GROUP_ID:
             in_allusers_upn |= g.get("upns", set())
-        if ENTRA_SUPERADMIN_GROUP_ID and g.get("id") == ENTRA_SUPERADMIN_GROUP_ID:
+
+        if superadmin_enabled and g.get("id") == ENTRA_SUPERADMIN_GROUP_ID:
             in_superadmin_upn |= g.get("upns", set())
 
     return desired, user_roles_by_upn, unix_to_upn, upn_enabled_global, in_allusers_upn, in_superadmin_upn
+
 
 # Function: _disablePveIfKnown
 # Purpose : Try to disable the PVE account for a unix user every run (idempotent).
@@ -1226,37 +1412,66 @@ def _disablePveIfKnown(user: str, unix_to_upn: dict[str, str]):
 # Notes   : Locks when first seen; deletes after DELETE_AFTER; updates disabled/known in-place.
 def _graceDeleteOrCountdown(user: str, disabled: dict, known: set, unix_to_upn: dict[str, str]):
     if user in RESERVED_USERS:
-        disabled.pop(user, None); known.discard(user); return
-    if not fncUserExists(user):
-        disabled.pop(user, None); known.discard(user); return
-
-    if user not in disabled:
-        fncLockUser(user)
-        disabled[user] = _get_utc_datetime().isoformat()
-        logging.info("User %s not in Entra allow-groups; locked and marked for deletion in %s",
-                     user, str(DELETE_AFTER))
-        # NEW: always try to disable PVE now
-        _disablePveIfKnown(user, unix_to_upn)
+        disabled.pop(user, None)
+        known.discard(user)
         return
 
-    # Already in grace → keep trying to disable PVE (idempotent) in case mapping failed earlier
-    _disablePveIfKnown(user, unix_to_upn)
+    if not fncUserExists(user):
+        disabled.pop(user, None)
+        known.discard(user)
+        return
 
-    # Countdown handling (unchanged)
+    # Always revoke privilege while not desired
+    fncRemoveSudoers(user)
+    fncRemoveUserFromGroup(user, "sudo")
+
+    now = _get_utc_datetime()
+
+    # FIRST SEEN → enter grace
+    if user not in disabled:
+        fncLockUser(user)
+        disabled[user] = now.isoformat()
+
+        logging.info(
+            "User %s not in Entra allow-groups; locked and marked for deletion in %s",
+            user, str(DELETE_AFTER)
+        )
+
+        # Disable PVE immediately
+        _disablePveIfKnown(user, unix_to_upn)
+
+        # Update PVE comment
+        upn = unix_to_upn.get(user)
+        src_label = _pickSourceGroupName(upn, []) if upn else None
+        _setPveDeletionComment(user, now, unix_to_upn, src_label)
+
+        return
+
+    # ALREADY IN GRACE
     try:
         locked_at = _parse_iso_datetime(disabled[user])
     except Exception:
-        locked_at = _get_utc_datetime()
+        locked_at = now
         disabled[user] = locked_at.isoformat()
 
-    if _get_utc_datetime() - locked_at >= DELETE_AFTER:
+    # Keep PVE disabled (idempotent)
+    _disablePveIfKnown(user, unix_to_upn)
+
+    # Refresh comment every run (keeps timestamp accurate if state file edited)
+    upn = unix_to_upn.get(user)
+    src_label = _pickSourceGroupName(upn, []) if upn else None
+    _setPveDeletionComment(user, locked_at, unix_to_upn, src_label)
+
+    # Expiry check
+    if now - locked_at >= DELETE_AFTER:
         logging.info("User %s disabled for >= %s; deleting", user, str(DELETE_AFTER))
         fncDeleteUser(user)
         disabled.pop(user, None)
         known.discard(user)
     else:
-        remain = DELETE_AFTER - (_get_utc_datetime() - locked_at)
+        remain = DELETE_AFTER - (now - locked_at)
         logging.info("User %s still in grace; %s remaining", user, str(remain).split(".")[0])
+
 
 # Function: _ensureBaselineGroups
 # Purpose : Ensure non-priv groups from EXTRA_GROUPS are present (excluding sudo).
@@ -1271,7 +1486,7 @@ def _ensureBaselineGroups(user: str):
 # Purpose : Main reconciliation loop. Create/lock/delete local + PVE users according to Entra groups & flags.
 # Notes   : Fail-open behavior when Graph not available; preserves existing users in realm to avoid mass-delete.
 def fncSync():
-    required_bins = ["pvesh","useradd","usermod","userdel","passwd","chage","chpasswd","visudo","getent","id","groupadd","gpasswd"]
+    required_bins = ["pvesh","pveum","useradd","usermod","userdel","passwd","chage", "chpasswd","visudo","getent","id","groupadd","gpasswd"]
     for key in required_bins:
         if not os.path.exists(BIN.get(key, "")):
             logging.error("Missing required binary: %s -> %s", key, BIN.get(key))
@@ -1284,25 +1499,35 @@ def fncSync():
     # ----------------- Pull Graph -----------------
     groups: list[dict] = []
     token = None
-    if GRAPH_ENFORCE and GRAPH_GROUP_IDS:
+
+    graph_required = bool(GRAPH_ENFORCE and GRAPH_GROUP_IDS)
+
+    if graph_required:
         token = fncGraphGetToken()
-        if token:
-            groups = fncGraphListManyGroups(GRAPH_GROUP_IDS, token, role_map=PVE_ROLE_BY_GROUP)
-            fncPrintGroupReport(groups)
+        if not token:
+            _graphFailOrWarn("Graph token unavailable while GRAPH_ENFORCE is enabled.")
         else:
-            fncPrintMessage("Graph token unavailable: proceeding without enforcement (fail-open).", "warning")
+            groups = fncGraphListManyGroups(GRAPH_GROUP_IDS, token, role_map=PVE_ROLE_BY_GROUP)
+            if not groups:
+                _graphFailOrWarn("Graph group fetch returned no data while GRAPH_ENFORCE is enabled.")
+            else:
+                fncPrintGroupReport(groups)
+
 
     # Compute desired + helper maps
     desired_unix, user_roles_by_upn, unix_to_upn, upn_enabled_global, in_allusers_upn, in_superadmin_upn = _computeDesiredFromGraph(groups)
 
     # Fallback if Graph empty/unavailable: keep current realm users to avoid mass-delete
     if not desired_unix:
+        if graph_required and not GRAPH_FAIL_OPEN:
+            _graphFailOrWarn("Graph produced empty desired user set; refusing to fall back (fail-closed).")
         desired_unix = fncGetPveUsersForRealm(REALM)
         logging.warning("Graph empty/unavailable; falling back to PVE realm users as desired.")
     logging.info("Desired (unix)=%s", sorted(desired_unix))
 
     # Candidates we might need to hold if not desired
-    realm_present = fncGetPveUsersForRealm(REALM)
+    realm_present = fncGetAllPveUsersForRealm(REALM)
+
     candidates = known | realm_present
 
     # ----------------- 1) Hold/Delete: users not in any allowed group -----------------
@@ -1325,47 +1550,52 @@ def fncSync():
         entra_enabled = upn_enabled_global.get(upn, True) if upn is not None else True
 
         if not entra_enabled:
-            # Entra account disabled but still in groups → disable locally (no delete countdown)
+            # Entra user is disabled but still appears in allow-groups.
+            # Policy: lock locally + strip sudo, and disable the PVE user.
+            # IMPORTANT: do NOT schedule deletion (no 24h countdown) — this is a reversible state.
+
             fncLockUser(user)
-            if user not in disabled:
-                disabled[user] = _get_utc_datetime().isoformat()
-            upn = unix_to_upn.get(user)   # original case for PVE
-            is_superadmin = (upn and upn.lower() in in_superadmin_ci)
-            # ...
-        
+
+            # Ensure we don't accidentally delete later because of a stale "disabled" timer
+            disabled.pop(user, None)
+
+            # Always remove sudo privileges in this state
+            fncRemoveSudoers(user)
+            fncRemoveUserFromGroup(user, "sudo")
+
+            # Best-effort: disable the matching PVE account (enable=0), and update metadata if we have it
+            upn = unix_to_upn.get(user)
             if upn:
-                # Build comment + pull meta from the Graph groups snapshot
-                src_label = _pickSourceGroupName(upn, groups)
-                meta = _lookupUserMeta(upn, groups)
-                comment = f"Synced from Entra via {src_label} Group" if src_label else None
+                src_label = None
+                meta = {}
 
                 try:
+                    src_label = _pickSourceGroupName(upn, groups) if groups else None
+                    meta = _lookupUserMeta(upn, groups) if groups else {}
+                except Exception as e:
+                    logging.debug("Metadata lookup failed for %s: %s", upn, e)
+
+                comment = f"Synced from Entra via {src_label} Group" if src_label else "Synced from Entra"
+
+
+                try:
+                    # Ensure the PVE user exists, but mark disabled
                     fncPveEnsureUser(
                         upn,
-                        enabled=True,
+                        enabled=False,
                         email=meta.get("mail"),
                         comment=comment,
                         firstname=meta.get("givenName"),
                         lastname=meta.get("surname"),
                     )
-
-                    # Then assign roles as you already do
-                    roles = set(user_roles_by_upn.get(upn, set()))
-
-                    # Make AllUsers additive if you want:
-                    if (upn in in_allusers_upn) and ENTRA_ALLUSERS_PVE_ROLE and not roles:
-                        roles = {ENTRA_ALLUSERS_PVE_ROLE}
-
-                    if roles:
-                        fncPveEnsureAclRoles(fncPveUseridFromUpn(upn), roles, path="/")
-
                 except Exception as e:
-                    logging.error("PVE provisioning failed for %s: %s", upn, e)
+                    logging.error("PVE disable/update failed for %s: %s", upn, e)
+            else:
+                logging.debug("Entra-disabled user %s: could not map back to UPN for PVE disable.", user)
 
-            fncRemoveSudoers(user)
-            fncRemoveUserFromGroup(user, "sudo")
             known.add(user)
             continue
+
 
         # Entra enabled → ensure unlocked and baseline non-priv groups
         fncUnlockUser(user)
@@ -1384,20 +1614,30 @@ def fncSync():
         # PVE user ensure + roles
         if upn:
             try:
-                fncPveEnsureUser(upn, enabled=True)
+                meta, comment = _buildPveMetaForUpn(upn, groups)
+
+                fncPveEnsureUser(
+                    upn,
+                    enabled=True,
+                    email=meta.get("mail"),
+                    comment=comment,
+                    firstname=meta.get("givenName"),
+                    lastname=meta.get("surname"),
+                )
+
                 roles = set(user_roles_by_upn.get(upn, set()))
 
                 # If user ends up only in AllUsers and it has a mapped role, ensure it
-                if (upn in in_allusers_upn) and ENTRA_ALLUSERS_PVE_ROLE:
-                    if not roles:
+                if ENTRA_ALLUSERS_GROUP_ID and ENTRA_ALLUSERS_PVE_ROLE:
+                    if (upn in in_allusers_upn) and not roles:
                         roles = {ENTRA_ALLUSERS_PVE_ROLE}
-                    # else: AllUsers may be additive; leave as-is unless you want exact sync
 
                 if roles:
                     fncPveEnsureAclRoles(fncPveUseridFromUpn(upn), roles, path="/")
-                # NOTE: If you want *exact* role sync (remove extras), we can add an ACL prune helper.
+
             except Exception as e:
                 logging.error("PVE provisioning failed for %s: %s", upn, e)
+
 
         # Clear “disabled” state if present and mark known
         disabled.pop(user, None)

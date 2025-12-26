@@ -16,28 +16,49 @@ from datetime import datetime
 # Paths & constants
 # ============================
 ROOT_DIR = Path(__file__).resolve().parent
-SCRIPT_SRC = ROOT_DIR / "sudomatic5000.py"
+SCRIPT_SRC = ROOT_DIR / "entramoxreconciler.py"
 REQS = ROOT_DIR / "requirements.txt"
 VERSION = "1.4.1a"
 
-# System paths
-SCRIPT_DST = Path("/usr/local/sbin/sudomatic5000.py")
-CHECKER = Path("/usr/local/sbin/sudomatic_check.sh")
-SERVICE = Path("/etc/systemd/system/sudomatic.service")
-TIMER = Path("/etc/systemd/system/sudomatic.timer")
-LOGDIR = Path("/var/log/sudomatic5000")
-ENVFILE = Path("/etc/sudomatic5000.env")
-KEYFILE = Path("/etc/sudomatic5000.key")      # separate env file, 0600
-ENC_KEY_ENV = "SUDOMATIC_ENC_KEY"             # the env var name holding the Fernet key
-ENV_ASSIGN_RE = re.compile(r"""^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:'([^']*)'|"([^"]*)"|([^\s#]+))\s*(?:#.*)?$""")
+# ============================================================
+# NEW: entramoxreconciler (current installation target)
+# ============================================================
+SCRIPT_DST = Path("/usr/local/sbin/entramoxreconciler.py")
+CHECKER = Path("/usr/local/sbin/entramox_check.sh")
+SERVICE = Path("/etc/systemd/system/entramoxreconciler.service")
+TIMER = Path("/etc/systemd/system/entramoxreconciler.timer")
+LOGDIR = Path("/var/log/entramoxreconciler")
+ENVFILE = Path("/etc/entramoxreconciler.env")
+KEYFILE = Path("/etc/entramoxreconciler.key")
+
+# Updated ENC_KEY_ENV (new canonical name)
+ENC_KEY_ENV = "ENTRAMOX_ENC_KEY"
+
+# ============================================================
+# LEGACY: sudomatic5000 (for upgrades/migration)
+# ============================================================
+LEGACY_SCRIPT_DST = Path("/usr/local/sbin/sudomatic5000.py")
+LEGACY_CHECKER = Path("/usr/local/sbin/sudomatic_check.sh")
+LEGACY_SERVICE = Path("/etc/systemd/system/sudomatic.service")
+LEGACY_TIMER = Path("/etc/systemd/system/sudomatic.timer")
+LEGACY_LOGDIR = Path("/var/log/sudomatic5000")
+LEGACY_ENVFILE = Path("/etc/sudomatic5000.env")
+LEGACY_KEYFILE = Path("/etc/sudomatic5000.key")
+
+# Legacy key env var name (supported for upgrades)
+LEGACY_ENC_KEY_ENV = "SUDOMATIC_ENC_KEY"
+
+ENV_ASSIGN_RE = re.compile(
+    r"""^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:'([^']*)'|"([^"]*)"|([^\s#]+))\s*(?:#.*)?$"""
+)
 
 BANNER = r"""
-   _____ _    _ _____   ____  __  __       _______ _____ _____   _____  ___   ___   ___  
-  / ____| |  | |  __ \ / __ \|  \/  |   /\|__   __|_   _/ ____| | ____|/ _ \ / _ \ / _ \ 
- | (___ | |  | | |  | | |  | | \  / |  /  \  | |    | || |      | |__ | | | | | | | | | |
-  \___ \| |  | | |  | | |  | | |\/| | / /\ \ | |    | || |      |___ \| | | | | | | | | |
-  ____) | |__| | |__| | |__| | |  | |/ ____ \| |   _| || |____   ___) | |_| | |_| | |_| |
- |_____/ \____/|_____/ \____/|_|  |_/_/    \_\_|  |_____\_____| |____/ \___/ \___/ \___/ 
+  ______       _                                   _____                           _ _           
+ |  ____|     | |                                 |  __ \                         (_) |          
+ | |__   _ __ | |_ _ __ __ _ _ __ ___   _____  __ | |__) |___  ___ ___  _ __   ___ _| | ___ _ __ 
+ |  __| | '_ \| __| '__/ _` | '_ ` _ \ / _ \ \/ / |  _  // _ \/ __/ _ \| '_ \ / __| | |/ _ \ '__|
+ | |____| | | | |_| | | (_| | | | | | | (_) >  <  | | \ \  __/ (_| (_) | | | | (__| | |  __/ |   
+ |______|_| |_|\__|_|  \__,_|_| |_| |_|\___/_/\_\ |_|  \_\___|\___\___/|_| |_|\___|_|_|\___|_|   
                 Turning realms into real users, one sudo at a time.
                 ------------------------------------------------
                 ::        %INSERT RELEVANT DISCORD HERE       ::
@@ -47,7 +68,7 @@ BANNER = r"""
 
 VERSION_INFO = f"""
 ==============================================
-| Deano's Sudomatic 5000                      |
+| Deano's Entramox Reconciler                 |
 | Version: {VERSION}                          |
 |                                             |
 | Syncs Proxmox OIDC users to local Linux:    |
@@ -66,6 +87,8 @@ VERSION_INFO = f"""
 | 21/08/2025: Pinned bins, lockfile,          |
 |             reserved users, domain filter,  |
 |             sudo allow-list, logrotate.     |
+| 26/12/2025: Renamed Script to something     |
+              useful.                         |
 ==============================================
 """
 
@@ -91,7 +114,6 @@ BLURBS = [
 # Colour / output helpers
 # ============================
 _cinit(autoreset=True)
-
 _COLOR_MONO = False
 
 def fncSetColorMode(monochrome: bool):
@@ -174,14 +196,75 @@ def fncShQuote(val: str) -> str:
         val = ""
     return "'" + val.replace("'", "'\"'\"'") + "'"
 
+def fncEnvBackupPath(p: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return p.with_suffix(p.suffix + f".bak-{ts}")
+
+# ============================
+# Legacy adoption/migration
+# ============================
+def fncMaybeAdoptLegacyArtifacts():
+    """
+    If legacy sudomatic5000 artifacts exist and the new ones do not, adopt them
+    (move/rename into the new entramoxreconciler locations). Keeps backups for files.
+    Also migrates the key var name inside the key file if needed.
+    """
+    def adopt_file(src: Path, dst: Path, label: str):
+        if src.exists() and not dst.exists():
+            try:
+                backup = fncEnvBackupPath(src)
+                shutil.copy2(src, backup)
+                src.rename(dst)
+                fncOk(f"Adopted legacy {label}: {src} -> {dst} (backup: {backup})")
+            except Exception as e:
+                fncWarn(f"Could not adopt legacy {label} {src} -> {dst}: {e}")
+
+    def adopt_dir(src: Path, dst: Path, label: str):
+        if src.exists() and src.is_dir() and not dst.exists():
+            try:
+                src.rename(dst)
+                fncOk(f"Adopted legacy {label}: {src} -> {dst}")
+            except Exception as e:
+                fncWarn(f"Could not adopt legacy {label} {src} -> {dst}: {e}")
+
+    # adopt in a sensible order
+    adopt_file(LEGACY_ENVFILE, ENVFILE, "env file")
+    adopt_file(LEGACY_KEYFILE, KEYFILE, "key file")
+    adopt_file(LEGACY_SCRIPT_DST, SCRIPT_DST, "installed script")
+    adopt_file(LEGACY_CHECKER, CHECKER, "checker")
+    adopt_file(LEGACY_SERVICE, SERVICE, "service unit")
+    adopt_file(LEGACY_TIMER, TIMER, "timer unit")
+    adopt_dir(LEGACY_LOGDIR, LOGDIR, "log dir")
+
+    # Migrate key var name in KEYFILE if it still uses legacy var
+    if KEYFILE.exists():
+        try:
+            txt = KEYFILE.read_text()
+            if LEGACY_ENC_KEY_ENV in txt and ENC_KEY_ENV not in txt:
+                backup = fncEnvBackupPath(KEYFILE)
+                shutil.copy2(KEYFILE, backup)
+                new_txt = re.sub(
+                    rf"(?m)^\s*{re.escape(LEGACY_ENC_KEY_ENV)}\s*=",
+                    f"{ENC_KEY_ENV}=",
+                    txt,
+                )
+                KEYFILE.write_text(new_txt)
+                os.chmod(KEYFILE, 0o600)
+                fncOk(f"Migrated key var name inside {KEYFILE} ({LEGACY_ENC_KEY_ENV} -> {ENC_KEY_ENV}) (backup: {backup})")
+        except Exception as e:
+            fncWarn(f"Could not migrate key env var name inside {KEYFILE}: {e}")
+
+# ============================
+# Key helpers (supports legacy)
+# ============================
 def fncEnsureKeyfile():
-    """Ensure /etc/sudomatic5000.key exists with a Fernet key (mode 0600)."""
+    """Ensure KEYFILE exists with a Fernet key (mode 0600). Writes ENC_KEY_ENV going forward."""
     from base64 import urlsafe_b64encode
     try:
         if KEYFILE.exists():
             os.chmod(KEYFILE, 0o600)
             return
-        raw = os.urandom(32)                       # 32 bytes -> 44-char base64 urlsafe Fernet key
+        raw = os.urandom(32)
         key_b64 = urlsafe_b64encode(raw).decode()
         KEYFILE.write_text(f"{ENC_KEY_ENV}={key_b64}\n")
         os.chmod(KEYFILE, 0o600)
@@ -196,21 +279,23 @@ def _fncParseKeyfile(path: Path) -> str | None:
             return None
         for line in path.read_text().splitlines():
             line = line.strip()
-            if not line or line.startswith("#"): 
+            if not line or line.startswith("#"):
                 continue
             if "=" in line:
                 k, v = line.split("=", 1)
-                if k.strip() == ENC_KEY_ENV:
+                k = k.strip()
+                if k in (ENC_KEY_ENV, LEGACY_ENC_KEY_ENV):
                     return v.strip()
     except Exception:
         return None
     return None
 
 def fncLoadEncKey() -> str | None:
-    """Prefer env (runtime), else the keyfile (installer/update)."""
-    val = os.environ.get(ENC_KEY_ENV, "").strip()
-    if val:
-        return val
+    """Prefer env (runtime), else the keyfile. Supports both new + legacy env var names."""
+    for var in (ENC_KEY_ENV, LEGACY_ENC_KEY_ENV):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
     return _fncParseKeyfile(KEYFILE)
 
 def fncEncryptSecretFernet(secret: str, key_b64: str) -> str:
@@ -218,15 +303,10 @@ def fncEncryptSecretFernet(secret: str, key_b64: str) -> str:
     token = Fernet(key_b64.encode()).encrypt(secret.encode()).decode()
     return f"fernet:{token}"
 
-def fncEnvBackupPath(p: Path) -> Path:
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return p.with_suffix(p.suffix + f".bak-{ts}")
-
 def fncEncryptIfNeededInEnv(env_path: Path = ENVFILE):
     """
-    If ENTR_CLNT_SEC (plaintext) exists, encrypt it to ENTR_CLNT_SEC_ENC using SUDOMATIC_ENC_KEY
-    and blank ENTR_CLNT_SEC.
-    Preserves comments/formatting as much as possible.
+    If ENTR_CLNT_SEC (plaintext) exists, encrypt it to ENTR_CLNT_SEC_ENC using ENC_KEY_ENV/KEYFILE
+    and blank ENTR_CLNT_SEC. Preserves comments/formatting as much as possible.
     """
     if not env_path.exists():
         fncInfo(f"No env at {env_path}; nothing to migrate.")
@@ -240,9 +320,8 @@ def fncEncryptIfNeededInEnv(env_path: Path = ENVFILE):
     lines = env_path.read_text().splitlines(keepends=False)
     changed = False
 
-    # Discover current values/positions
     plain_val, plain_idx = None, None
-    enc_val, enc_idx = None, None
+    enc_idx = None
 
     for idx, line in enumerate(lines):
         m = ENV_ASSIGN_RE.match(line)
@@ -251,31 +330,22 @@ def fncEncryptIfNeededInEnv(env_path: Path = ENVFILE):
         key = m.group(1)
         val = m.group(2) or m.group(3) or m.group(4) or ""
 
-        if key == "ENTR_CLNT_SEC":
-            if val.strip():
-                plain_val, plain_idx = val, idx
-        elif key == "ENTR_CLNT_SEC_ENC":
-            if val.strip():
-                enc_val, enc_idx = val, idx
+        if key == "ENTR_CLNT_SEC" and val.strip():
+            plain_val, plain_idx = val, idx
+        elif key == "ENTR_CLNT_SEC_ENC" and val.strip():
+            enc_idx = idx
 
-    # If plaintext, ensure encrypted + blank plaintext
     if plain_val is not None:
         if enc_idx is None:
-            # create encrypted value
             try:
-                enc_blob = fncEncryptSecretFernet(plain_val, enc_key)  # 'fernet:<token>'
+                enc_blob = fncEncryptSecretFernet(plain_val, enc_key)
             except Exception as e:
                 fncErr(f"Failed to encrypt existing ENTR_CLNT_SEC: {e}")
                 return
-            # Append encrypted var near the bottom
             lines.append("")
             lines.append(f"ENTR_CLNT_SEC_ENC={fncShQuote(enc_blob)}")
             changed = True
-        else:
-            # Already had encrypted value;
-            pass
 
-        # Blank the plaintext line if present
         if plain_idx is not None and not lines[plain_idx].startswith("#"):
             lines[plain_idx] = "ENTR_CLNT_SEC=''"
             changed = True
@@ -284,7 +354,6 @@ def fncEncryptIfNeededInEnv(env_path: Path = ENVFILE):
         fncInfo("Env examined; no changes required.")
         return
 
-    # Backup and write
     backup = fncEnvBackupPath(env_path)
     try:
         shutil.copy2(env_path, backup)
@@ -300,7 +369,7 @@ def fncEncryptIfNeededInEnv(env_path: Path = ENVFILE):
 # Interactive prompts
 # ============================
 def fncPromptUseGraph() -> bool:
-    fncHeading("\n== Sudomatic 5000 — Membership Source ==")
+    fncHeading("\n== Entramox Reconciler — Membership Source ==")
     print(f"{fncColor('[1]', 'white')} Use {fncColor('Microsoft Graph', 'cyan')} (enforce members from an Entra group)")
     print(f"{fncColor('[2]', 'white')} Rely on {fncColor('PVE realm accounts only', 'yellow')} (no Graph enforcement)")
     while True:
@@ -363,32 +432,7 @@ def fncChooseFromList(prompt_title: str, options: list[str], allow_none: bool = 
                 return None if (allow_none and choice == "<none>") else choice
         fncWarn("Invalid selection, try again.")
 
-def fncPromptSuperAdminGroup() -> tuple[str, bool]:
-    """Ask for optional Super Admin group; optionally auto-sudo just for that group."""
-    fncHeading("\n== Optional Super Admin group ==")
-    print("Provide the Entra group " + fncColor("Object ID", "bold") + " (GUID) for Super Admins.")
-    print(fncColor("This does NOT affect other users. Leave blank to skip.", "yellow"))
-    gid = input(f"{fncColor('?', 'cyan')} Super Admin Group Object ID (GUID): ").strip()
-    auto = False
-    if gid:
-        auto = input(f"{fncColor('?', 'cyan')} Auto-grant {fncColor('sudo', 'bold')} to Super Admin members? [{fncColor('Y', 'green')}/n]: ").strip().lower() in ("", "y", "yes")
-    return gid, auto
-
-def fncPromptAllUsersGroup() -> tuple[str | None, str | None]:
-    """Optional All Users group (baseline); map it to a PVE role."""
-    fncHeading("\n== Optional 'All Users' group ==")
-    print("Provide an Entra group Object ID that grants baseline access to *all* its members on this host.")
-    print(fncColor("Leave blank to skip.", "yellow"))
-    gid = input(f"{fncColor('?', 'cyan')} All Users Group Object ID (GUID): ").strip()
-    if not gid:
-        return None, None
-    roles = fncGetPveRoles()
-    chosen = fncChooseFromList("Select baseline PVE role for All Users", roles, allow_none=True,
-                               default="PVEUser" if "PVEUser" in roles else None)
-    return gid, chosen
-
 def fncPromptRoleMappings() -> list[dict]:
-    """Zero or more Entra group → PVE role mappings."""
     mappings = []
     roles = fncGetPveRoles()
     fncHeading("\n== Entra Group → PVE Role mappings (optional) ==")
@@ -404,27 +448,314 @@ def fncPromptRoleMappings() -> list[dict]:
     return mappings
 
 # ============================
+# Build env content
+# ============================
+def fncBuildEnvfileContent() -> str:
+    import re
+    from getpass import getpass
+
+    def ask_bool(q: str, default: bool = True) -> bool:
+        hint = "Y/n" if default else "y/N"
+        while True:
+            a = input(f"{fncColor(q, 'cyan', 'bold')} {fncColor(f'[{hint}]', 'gray')}: ").strip().lower()
+            if not a:
+                return default
+            if a in ("y", "yes"):
+                return True
+            if a in ("n", "no"):
+                return False
+            fncWarn("Please answer y or n.")
+
+    def ask_nonempty(q: str, default: str | None = None) -> str:
+        while True:
+            prompt = f"{fncColor(q, 'cyan', 'bold')}{fncColor(f' [{default}]', 'gray') if default else ''}: "
+            a = input(prompt).strip()
+            if a:
+                return a
+            if default is not None:
+                return default
+            fncWarn("Value cannot be empty.")
+
+    def ask_domains() -> str:
+        raw = input(fncColor("Allowed UPN domains (space/comma-separated, empty = allow all): ",
+                             "cyan", "bold")).strip()
+        if not raw:
+            return ""
+        parts = [p.strip().lower() for p in re.split(r"[,\s]+", raw) if p.strip()]
+        return " ".join(sorted(set(parts)))
+
+    print()
+    fncHeading("== Entramox Reconciler — Runtime configuration ==")
+    realm = ask_nonempty("Proxmox Realm name (must match PVE exactly)")
+    shell = ask_nonempty("Default shell for new users", default="/bin/bash")
+    domains = ask_domains()
+
+    lines = [
+        "# Autogenerated by Entramox Reconciler installer",
+        "# Keep this file 0600, owner root",
+        "",
+        f"REALM={fncShQuote(realm)}",
+        f"DEFAULT_SHELL={fncShQuote(shell)}",
+        "GRANT_SUDO='false'",
+        "SUDO_NOPASSWD='false'",
+        f"ALLOWED_UPN_DOMAINS={fncShQuote(domains)}",
+        "",
+    ]
+
+    if not fncPromptUseGraph():
+        fncWarn("Graph enforcement disabled — relying on PVE realm only.")
+        lines += [
+            "GRAPH_ENFORCE='false'",
+            "GRAPH_FAIL_OPEN='true'",
+            "# GRAPH_ACCESS_TOKEN=''   # not used when GRAPH_ENFORCE=false",
+            "# ENTR_TENANT_ID=''       # not used when GRAPH_ENFORCE=false",
+            "# ENTR_CLNT_ID=''         # not used when GRAPH_ENFORCE=false",
+            "# ENTR_CLNT_SEC=''        # not used when GRAPH_ENFORCE=false",
+        ]
+        return "\n".join(lines) + "\n"
+
+    fncOk("Graph enforcement enabled.")
+    lines.append("GRAPH_ENFORCE='true'")
+
+    roles = fncGetPveRoles()
+
+    print()
+    fncHeading("== All Users (baseline) group ==")
+    all_gid = ask_nonempty("All Users Entra group — Object ID (ENTRA_ALLUSERS_GROUP_ID)")
+    lines.append(f"ENTRA_ALLUSERS_GROUP_ID={fncShQuote(all_gid)}")
+
+    all_role = fncChooseFromList(
+        "Select PVE role for All Users group",
+        roles,
+        allow_none=False,
+        default="PVEUser" if "PVEUser" in roles else None
+    )
+    lines.append(f"ENTRA_ALLUSERS_PVE_ROLE={fncShQuote(all_role)}")
+
+    fail_open = ask_bool("Fail OPEN if Graph is unavailable?", default=True)
+    lines.append(f"GRAPH_FAIL_OPEN={fncShQuote('true' if fail_open else 'false')}")
+
+    print()
+    fncHeading("== Optional Super Admin group ==")
+    fncInfo("Provide the Entra group Object ID (GUID) for Super Admins.")
+    fncInfo("This does NOT affect baseline access. Leave blank to skip.")
+    sa_gid = input(fncColor("Super Admin Group Object ID (GUID): ", "cyan", "bold")).strip()
+    if sa_gid:
+        lines.append(f"ENTRA_SUPERADMIN_GROUP_ID={fncShQuote(sa_gid)}")
+        sa_role = fncChooseFromList(
+            "Select PVE role for Super Admin group",
+            roles,
+            allow_none=False,
+            default="PVEAdmin" if "PVEAdmin" in roles else None
+        )
+        lines.append(f"ENTRA_SUPERADMIN_PVE_ROLE={fncShQuote(sa_role)}")
+        auto = ask_bool("Auto-grant sudo to Super Admin group members?", default=True)
+        lines.append(f"SUPERADMIN_GROUP_AUTO_SUDO={'true' if auto else 'false'}")
+    else:
+        lines.append("ENTRA_SUPERADMIN_GROUP_ID=''")
+        lines.append("ENTRA_SUPERADMIN_PVE_ROLE=''")
+        lines.append("SUPERADMIN_GROUP_AUTO_SUDO='false'")
+
+    print()
+    fncHeading("== Additional Entra Group → PVE Role mappings (optional) ==")
+    role_maps = fncPromptRoleMappings()
+    role_maps_json = json.dumps(role_maps, separators=(',', ':'))
+    lines.append(f"ENTRA_ROLE_MAP={fncShQuote(role_maps_json)}")
+
+    print()
+    fncHeading("== Microsoft Graph authentication mode ==")
+    mode = fncPromptAuthMode()
+    if mode == "access":
+        fncInfo("You chose Access Token mode.")
+        fncWarn("Delegated tokens are short-lived (~1 hour). Good for testing; not ideal for timers.")
+        token = getpass(fncColor("Paste GRAPH_ACCESS_TOKEN (input hidden, can be empty): ", "cyan", "bold")).strip()
+        lines.append(f"GRAPH_ACCESS_TOKEN={fncShQuote(token)}")
+        lines.append("AUTH_MODE='access'")
+    else:
+        fncInfo("You chose Application Tokens (client credentials).")
+        tenant = ask_nonempty("ENTR_TENANT_ID (Tenant ID GUID)")
+        client = ask_nonempty("ENTR_CLNT_ID (App / Client ID GUID)")
+        secret = getpass(fncColor("ENTR_CLNT_SEC (Client Secret) [input hidden]: ", "cyan", "bold")).strip()
+
+        enc_key = fncLoadEncKey()
+        if not enc_key:
+            fncErr(f"Missing encryption key. Expected {KEYFILE} with {ENC_KEY_ENV}. Aborting to avoid writing plaintext.")
+            sys.exit(1)
+
+        try:
+            enc = fncEncryptSecretFernet(secret, enc_key)
+        except Exception as e:
+            fncErr(f"Encryption failed ({e}). Aborting to avoid writing plaintext.")
+            sys.exit(1)
+
+        lines += [
+            f"ENTR_TENANT_ID={fncShQuote(tenant)}",
+            f"ENTR_CLNT_ID={fncShQuote(client)}",
+            "ENTR_CLNT_SEC=''",
+            f"ENTR_CLNT_SEC_ENC={fncShQuote(enc)}",
+            "AUTH_MODE='application'",
+        ]
+        fncOk("Encrypted ENTR_CLNT_SEC and stored ENTR_CLNT_SEC_ENC in env.")
+
+    return "\n".join(lines) + "\n"
+
+# ============================
+# Writers
+# ============================
+def fncWriteEnvfile(content: str):
+    if ENVFILE.exists():
+        fncInfo(f"Updating {ENVFILE}")
+    else:
+        fncOk(f"Creating {ENVFILE}")
+    ENVFILE.write_text(content)
+    os.chmod(ENVFILE, 0o600)
+    fncOk("Wrote secrets/config to " + fncColor(str(ENVFILE), "white", "bold") + " (mode 0600)")
+
+def fncWriteChecker(expected_sha: str):
+    try:
+        expected_env_sha = fncSha256Sum(ENVFILE) if ENVFILE.exists() else ""
+    except Exception:
+        expected_env_sha = ""
+    try:
+        expected_key_sha = fncSha256Sum(KEYFILE) if KEYFILE.exists() else ""
+    except Exception:
+        expected_key_sha = ""
+
+    checker_script = f"""#!/bin/bash
+set -euo pipefail
+
+SCRIPT="{SCRIPT_DST}"
+ENVFILE="{ENVFILE}"
+KEYFILE="{KEYFILE}"
+
+EXPECTED_SHA="{expected_sha}"
+EXPECTED_ENV_SHA="{expected_env_sha}"
+EXPECTED_KEY_SHA="{expected_key_sha}"
+
+log_warn() {{
+    logger -t entramox_runner "$1" || true
+    echo "$1" >&2
+}}
+
+fail() {{
+    logger -t entramox_runner "$1" || true
+    echo "$1" >&2
+    exit 1
+}}
+
+check_secure_file() {{
+    local p="$1"
+    if [[ ! -e "$p" ]]; then
+        log_warn "Integrity: missing file: $p"
+        return 0
+    fi
+    if [[ -L "$p" ]]; then
+        fail "Integrity: refusing to use symlink: $p"
+    fi
+    local uid
+    uid=$(stat -Lc %u "$p" 2>/dev/null || echo 99999)
+    if [[ "$uid" != "0" ]]; then
+        fail "Integrity: $p not owned by root (uid=$uid)"
+    fi
+    local mode
+    mode=$(stat -Lc %a "$p" 2>/dev/null || echo 777)
+    mode=${{mode: -3}}
+    if (( 10#"$mode" > 600 )); then
+        fail "Integrity: $p permissions too broad (have $mode, want <= 600)"
+    fi
+}}
+
+sha256_file() {{
+    /usr/bin/sha256sum "$1" | awk '{{print $1}}'
+}}
+
+ACTUAL_SHA=$(sha256_file "$SCRIPT")
+if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+    fail "Checksum mismatch! Potential tampering detected in $SCRIPT (have=$ACTUAL_SHA expect=$EXPECTED_SHA)"
+fi
+
+check_secure_file "$ENVFILE"
+if [[ -e "$ENVFILE" && -n "$EXPECTED_ENV_SHA" ]]; then
+    ACTUAL_ENV_SHA=$(sha256_file "$ENVFILE")
+    if [[ "$ACTUAL_ENV_SHA" != "$EXPECTED_ENV_SHA" ]]; then
+        log_warn "Integrity: env checksum changed: $ENVFILE (have=$ACTUAL_ENV_SHA expect=$EXPECTED_ENV_SHA)"
+    fi
+fi
+
+check_secure_file "$KEYFILE"
+if [[ -e "$KEYFILE" && -n "$EXPECTED_KEY_SHA" ]]; then
+    ACTUAL_KEY_SHA=$(sha256_file "$KEYFILE")
+    if [[ "$ACTUAL_KEY_SHA" != "$EXPECTED_KEY_SHA" ]]; then
+        log_warn "Integrity: key checksum changed: $KEYFILE (have=$ACTUAL_KEY_SHA expect=$EXPECTED_KEY_SHA)"
+    fi
+fi
+
+exit 0
+"""
+    CHECKER.write_text(checker_script)
+    os.chmod(CHECKER, 0o700)
+    fncOk(f"Created/updated checker script at {CHECKER}")
+
+def fncWriteUnits():
+    service_unit = f"""[Unit]
+Description=Entramox Reconciler — Proxmox OIDC to Linux user sync
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-{ENVFILE}
+EnvironmentFile=-{KEYFILE}
+ExecCondition={CHECKER}
+ExecStart=/usr/bin/python3 {SCRIPT_DST}
+User=root
+"""
+    SERVICE.write_text(service_unit)
+    fncOk(f"Wrote service unit: {SERVICE}")
+
+    timer_unit = f"""[Unit]
+Description=Run Entramox Reconciler every 30 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30min
+Unit={SERVICE.name}
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+    TIMER.write_text(timer_unit)
+    fncOk(f"Wrote timer unit: {TIMER}")
+
+# ============================
 # Actions
 # ============================
 def fncDoUninstall(purge: bool = False):
     fncRequireRoot()
-    fncHeading("[*] Uninstalling Sudomatic 5000...")
+    fncHeading("[*] Uninstalling Entramox Reconciler...")
 
-    # Stop & disable units (ignore failures if not present)
-    for unit in ("sudomatic.timer", "sudomatic.service"):
-        try:
-            fncRun(["systemctl", "stop", unit])
-            fncInfo(f"Stopped {unit}")
-        except subprocess.CalledProcessError:
-            fncWarn(f"{unit} was not running")
-        try:
-            fncRun(["systemctl", "disable", unit])
-            fncInfo(f"Disabled {unit}")
-        except subprocess.CalledProcessError:
-            fncWarn(f"{unit} was not enabled")
+    # Stop & disable both new + legacy units (ignore failures)
+    units = [
+        (TIMER.name, SERVICE.name),
+        (LEGACY_TIMER.name, LEGACY_SERVICE.name),
+    ]
+    for timer_name, svc_name in units:
+        for unit in (timer_name, svc_name):
+            try:
+                fncRun(["systemctl", "stop", unit])
+                fncInfo(f"Stopped {unit}")
+            except subprocess.CalledProcessError:
+                fncWarn(f"{unit} was not running")
+            try:
+                fncRun(["systemctl", "disable", unit])
+                fncInfo(f"Disabled {unit}")
+            except subprocess.CalledProcessError:
+                fncWarn(f"{unit} was not enabled")
 
-    # Remove unit files
-    for p in (TIMER, SERVICE):
+    # Remove unit files (new + legacy)
+    for p in (TIMER, SERVICE, LEGACY_TIMER, LEGACY_SERVICE):
         try:
             if p.exists():
                 p.unlink()
@@ -434,15 +765,14 @@ def fncDoUninstall(purge: bool = False):
         except Exception as e:
             fncWarn(f"Could not remove {p}: {e}")
 
-    # Reload systemd after unit removals
     try:
         fncRun(["systemctl", "daemon-reload"])
         fncInfo("systemd daemon reloaded")
     except subprocess.CalledProcessError:
         fncWarn("Failed to reload systemd daemon")
 
-    # Remove installed script & checker
-    for p in (SCRIPT_DST, CHECKER):
+    # Remove installed script & checker (new + legacy)
+    for p in (SCRIPT_DST, CHECKER, LEGACY_SCRIPT_DST, LEGACY_CHECKER):
         try:
             if p.exists():
                 p.unlink()
@@ -452,23 +782,32 @@ def fncDoUninstall(purge: bool = False):
         except Exception as e:
             fncWarn(f"Could not remove {p}: {e}")
 
-    # Remove logrotate snippet if present
-    LOGROTATE = Path("/etc/logrotate.d/sudomatic5000")
-    try:
-        if LOGROTATE.exists():
-            LOGROTATE.unlink()
-            fncOk(f"Removed {LOGROTATE}")
-        else:
-            fncInfo(f"Not present: {LOGROTATE}")
-    except Exception as e:
-        fncWarn(f"Could not remove {LOGROTATE}: {e}")
+    # Remove logrotate snippets (new + legacy)
+    LOGROTATE_NEW = Path("/etc/logrotate.d/entramoxreconciler")
+    LOGROTATE_OLD = Path("/etc/logrotate.d/sudomatic5000")
+    for p in (LOGROTATE_NEW, LOGROTATE_OLD):
+        try:
+            if p.exists():
+                p.unlink()
+                fncOk(f"Removed {p}")
+            else:
+                fncInfo(f"Not present: {p}")
+        except Exception as e:
+            fncWarn(f"Could not remove {p}: {e}")
 
     # Optional removals
-    state_root = Path("/var/lib/sudomatic5000")  # parent of pve_oidc_sync
+    state_root_new = Path("/var/lib/entramoxreconciler")
+    state_root_old = Path("/var/lib/sudomatic5000")
+
     targets = [
-        ("env file", ENVFILE),
-        ("log dir", LOGDIR),
-        ("state dir", state_root),
+        ("env file (new)", ENVFILE),
+        ("key file (new)", KEYFILE),
+        ("log dir (new)", LOGDIR),
+        ("state dir (new)", state_root_new),
+        ("env file (legacy)", LEGACY_ENVFILE),
+        ("key file (legacy)", LEGACY_KEYFILE),
+        ("log dir (legacy)", LEGACY_LOGDIR),
+        ("state dir (legacy)", state_root_old),
     ]
 
     def ask(q: str) -> bool:
@@ -506,368 +845,58 @@ def fncDoUninstall(purge: bool = False):
 
     fncOk("Uninstall complete.")
     fncInfo("If you re-install later, run: "
-            + fncColor("systemctl daemon-reload && systemctl enable --now sudomatic.timer", "white", "bold"))
-
-def fncBuildEnvfileContent() -> str:
-    """
-    Build /etc/sudomatic5000.env content:
-    - Runtime: REALM, DEFAULT_SHELL, ALLOWED_UPN_DOMAINS
-    - Membership source: Graph vs PVE-only (and Graph auth details)
-    """
-    import re
-    from getpass import getpass
-
-    # ---- tiny inline helpers (keep installer tidy) ----
-    def ask_bool(q: str, default: bool = True) -> bool:
-        hint = "Y/n" if default else "y/N"
-        while True:
-            a = input(f"{fncColor(q, 'cyan', 'bold')} {fncColor(f'[{hint}]', 'gray')}: ").strip().lower()
-            if not a:
-                return default
-            if a in ("y", "yes"):
-                return True
-            if a in ("n", "no"):
-                return False
-            fncWarn("Please answer y or n.")
-
-    def ask_nonempty(q: str, default: str | None = None) -> str:
-        while True:
-            prompt = f"{fncColor(q, 'cyan', 'bold')}{fncColor(f' [{default}]', 'gray') if default else ''}: "
-            a = input(prompt).strip()
-            if a:
-                return a
-            if default is not None:
-                return default
-            fncWarn("Value cannot be empty.")
-
-    def ask_domains() -> str:
-        """
-        Ask for allowed UPN domains; returns a single space-separated string.
-        Empty input means 'allow all'.
-        """
-        raw = input(fncColor("Allowed UPN domains (space/comma-separated, empty = allow all): ",
-                             "cyan", "bold")).strip()
-        if not raw:
-            return ""
-        parts = [p.strip().lower() for p in re.split(r"[,\s]+", raw) if p.strip()]
-        return " ".join(sorted(set(parts)))
-
-    # ---- runtime basics ----
-    print()
-    fncHeading("== Sudomatic 5000 — Runtime configuration ==")
-    realm = ask_nonempty("Proxmox Realm name (must match PVE exactly)")
-    shell = ask_nonempty("Default shell for new users", default="/bin/bash")
-    domains = ask_domains()  # "" => no filtering
-
-    # No global 'grant sudo' — enforce via Super Admin group only
-    lines = [
-        "# Autogenerated by Sudomatic installer",
-        "# Keep this file 0600, owner root",
-        "",
-        f"REALM={fncShQuote(realm)}",
-        f"DEFAULT_SHELL={fncShQuote(shell)}",
-        "GRANT_SUDO='false'",            # do NOT grant sudo to all users
-        "SUDO_NOPASSWD='false'",         # irrelevant when GRANT_SUDO=false
-        f"ALLOWED_UPN_DOMAINS={fncShQuote(domains)}",  # space-separated list or empty
-        "",
-    ]
-
-    # ---- membership source ----
-    if not fncPromptUseGraph():
-        fncWarn("Graph enforcement disabled — relying on PVE realm only.")
-        lines += [
-            "GRAPH_ENFORCE='false'",
-            "GRAPH_FAIL_OPEN='true'",  # harmless here
-            "# GRAPH_ACCESS_TOKEN=''   # not used when GRAPH_ENFORCE=false",
-            "# ENTR_TENANT_ID=''       # not used when GRAPH_ENFORCE=false",
-            "# ENTR_CLNT_ID=''         # not used when GRAPH_ENFORCE=false",
-            "# ENTR_CLNT_SEC=''        # not used when GRAPH_ENFORCE=false",
-        ]
-        return "\n".join(lines) + "\n"
-
-    fncOk("Graph enforcement enabled.")
-    lines.append("GRAPH_ENFORCE='true'")
-
-    roles = fncGetPveRoles()
-
-    # REQUIRED: All Users / baseline access group
-    print()
-    fncHeading("== All Users (baseline) group ==")
-    all_gid = ask_nonempty("All Users Entra group — Object ID (ENTRA_ALLUSERS_GROUP_ID)")
-    lines.append(f"ENTRA_ALLUSERS_GROUP_ID={fncShQuote(all_gid)}")
-
-    # Pick the PVE role for All Users
-    all_role = fncChooseFromList(
-        "Select PVE role for All Users group",
-        roles,
-        allow_none=False,
-        default="PVEUser" if "PVEUser" in roles else None
-    )
-    lines.append(f"ENTRA_ALLUSERS_PVE_ROLE={fncShQuote(all_role)}")
-
-    fail_open = ask_bool("Fail OPEN if Graph is unavailable?", default=True)
-    lines.append(f"GRAPH_FAIL_OPEN={fncShQuote('true' if fail_open else 'false')}")
-
-    # Optional Super Admin group (sudo-capable; pick PVE role too)
-    print()
-    fncHeading("== Optional Super Admin group ==")
-    fncInfo("Provide the Entra group Object ID (GUID) for Super Admins.")
-    fncInfo("This does NOT affect baseline access. Leave blank to skip.")
-    sa_gid = input(fncColor("Super Admin Group Object ID (GUID): ", "cyan", "bold")).strip()
-    if sa_gid:
-        lines.append(f"ENTRA_SUPERADMIN_GROUP_ID={fncShQuote(sa_gid)}")
-        sa_role = fncChooseFromList(
-            "Select PVE role for Super Admin group",
-            roles,
-            allow_none=False,
-            default="PVEAdmin" if "PVEAdmin" in roles else None
-        )
-        lines.append(f"ENTRA_SUPERADMIN_PVE_ROLE={fncShQuote(sa_role)}")
-        auto = ask_bool("Auto-grant sudo to Super Admin group members?", default=True)
-        lines.append(f"SUPERADMIN_GROUP_AUTO_SUDO={'true' if auto else 'false'}")
-    else:
-        lines.append("ENTRA_SUPERADMIN_GROUP_ID=''")
-        lines.append("ENTRA_SUPERADMIN_PVE_ROLE=''")
-        lines.append("SUPERADMIN_GROUP_AUTO_SUDO='false'")
-
-    # Optional: additional Entra group → PVE role mappings
-    print()
-    fncHeading("== Additional Entra Group → PVE Role mappings (optional) ==")
-    role_maps = fncPromptRoleMappings()  # already asks for a PVE role per group
-    role_maps_json = json.dumps(role_maps, separators=(',', ':'))
-    lines.append(f"ENTRA_ROLE_MAP={fncShQuote(role_maps_json)}")
-
-    # Auth mode
-    print()
-    fncHeading("== Microsoft Graph authentication mode ==")
-    mode = fncPromptAuthMode()
-    if mode == "access":
-        fncInfo("You chose Access Token mode.")
-        fncWarn("Delegated tokens are short-lived (~1 hour). Good for testing; not ideal for timers.")
-        token = getpass(fncColor("Paste GRAPH_ACCESS_TOKEN (input hidden, can be empty): ", "cyan", "bold")).strip()
-        lines.append(f"GRAPH_ACCESS_TOKEN={fncShQuote(token)}")
-        lines.append("AUTH_MODE='access'")
-    else:
-        fncInfo("You chose Application Tokens (client credentials).")
-        tenant = ask_nonempty("ENTR_TENANT_ID (Tenant ID GUID)")
-        client = ask_nonempty("ENTR_CLNT_ID (App / Client ID GUID)")
-        secret = getpass(fncColor("ENTR_CLNT_SEC (Client Secret) [input hidden]: ", "cyan", "bold")).strip()
-
-        # Load the key generated earlier by fncEnsureKeyfile()
-        enc_key = fncLoadEncKey()
-        if not enc_key:
-            fncErr(f"Missing encryption key. Expected {KEYFILE} with {ENC_KEY_ENV}. Aborting to avoid writing plaintext.")
-            sys.exit(1)
-
-        try:
-            enc = fncEncryptSecretFernet(secret, enc_key)   # -> 'fernet:<token>'
-        except Exception as e:
-            fncErr(f"Encryption failed ({e}). Aborting to avoid writing plaintext.")
-            sys.exit(1)
-
-        lines += [
-            f"ENTR_TENANT_ID={fncShQuote(tenant)}",
-            f"ENTR_CLNT_ID={fncShQuote(client)}",
-            "ENTR_CLNT_SEC=''",                       # never store plaintext
-            f"ENTR_CLNT_SEC_ENC={fncShQuote(enc)}",   # encrypted blob
-            "AUTH_MODE='application'",
-        ]
-        fncOk("Encrypted ENTR_CLNT_SEC and stored ENTR_CLNT_SEC_ENC in env.")
-
-    return "\n".join(lines) + "\n"
-
-def fncWriteEnvfile(content: str):
-    if ENVFILE.exists():
-        fncInfo(f"Updating {ENVFILE}")
-    else:
-        fncOk(f"Creating {ENVFILE}")
-    ENVFILE.write_text(content)
-    os.chmod(ENVFILE, 0o600)
-    fncOk("Wrote secrets/config to "
-          + fncColor("/etc/sudomatic5000.env", "white", "bold")
-          + " (mode 0600)")
-
-def fncWriteChecker(expected_sha: str):
-    # capture current env/key hashes at generation time (used as baselines)
-    try:
-        expected_env_sha = fncSha256Sum(ENVFILE) if ENVFILE.exists() else ""
-    except Exception:
-        expected_env_sha = ""
-    try:
-        expected_key_sha = fncSha256Sum(KEYFILE) if KEYFILE.exists() else ""
-    except Exception:
-        expected_key_sha = ""
-
-    checker_script = f"""#!/bin/bash
-set -euo pipefail
-
-SCRIPT="{SCRIPT_DST}"
-ENVFILE="{ENVFILE}"
-KEYFILE="{KEYFILE}"
-
-EXPECTED_SHA="{expected_sha}"
-EXPECTED_ENV_SHA="{expected_env_sha}"
-EXPECTED_KEY_SHA="{expected_key_sha}"
-
-log_warn() {{
-    logger -t sudomatic_runner "$1" || true
-    echo "$1" >&2
-}}
-
-fail() {{
-    logger -t sudomatic_runner "$1" || true
-    echo "$1" >&2
-    exit 1
-}}
-
-check_secure_file() {{
-    # $1=path
-    local p="$1"
-    if [[ ! -e "$p" ]]; then
-        log_warn "Integrity: missing file: $p"
-        return 0
-    fi
-    # refuse symlinks
-    if [[ -L "$p" ]]; then
-        fail "Integrity: refusing to use symlink: $p"
-    fi
-    # root-owned?
-    local uid
-    uid=$(stat -Lc %u "$p" 2>/dev/null || echo 99999)
-    if [[ "$uid" != "0" ]]; then
-        fail "Integrity: $p not owned by root (uid=$uid)"
-    fi
-    # perms <= 0600
-    local mode
-    mode=$(stat -Lc %a "$p" 2>/dev/null || echo 777)
-    mode=${{mode: -3}}  # last three digits
-    if (( 10#"$mode" > 600 )); then
-        fail "Integrity: $p permissions too broad (have $mode, want <= 600)"
-    fi
-}}
-
-sha256_file() {{
-    /usr/bin/sha256sum "$1" | awk '{{print $1}}'
-}}
-
-# --- 1) Check main script checksum (hard fail on mismatch) ---
-ACTUAL_SHA=$(sha256_file "$SCRIPT")
-if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
-    fail "Checksum mismatch! Potential tampering detected in $SCRIPT (have=$ACTUAL_SHA expect=$EXPECTED_SHA)"
-fi
-
-# --- 2) Verify ENVFILE hardening; warn if checksum changed ---
-check_secure_file "$ENVFILE"
-if [[ -e "$ENVFILE" && -n "$EXPECTED_ENV_SHA" ]]; then
-    ACTUAL_ENV_SHA=$(sha256_file "$ENVFILE")
-    if [[ "$ACTUAL_ENV_SHA" != "$EXPECTED_ENV_SHA" ]]; then
-        log_warn "Integrity: env checksum changed: $ENVFILE (have=$ACTUAL_ENV_SHA expect=$EXPECTED_ENV_SHA)"
-    fi
-fi
-
-# --- 3) Verify KEYFILE hardening; warn if checksum changed ---
-check_secure_file "$KEYFILE"
-if [[ -e "$KEYFILE" && -n "$EXPECTED_KEY_SHA" ]]; then
-    ACTUAL_KEY_SHA=$(sha256_file "$KEYFILE")
-    if [[ "$ACTUAL_KEY_SHA" != "$EXPECTED_KEY_SHA" ]]; then
-        log_warn "Integrity: key checksum changed: $KEYFILE (have=$ACTUAL_KEY_SHA expect=$EXPECTED_KEY_SHA)"
-    fi
-fi
-
-exit 0
-"""
-    CHECKER.write_text(checker_script)
-    os.chmod(CHECKER, 0o700)
-    fncOk(f"Created/updated checker script at {CHECKER}")
-
-def fncWriteUnits():
-    # Service with env file
-    service_unit = f"""[Unit]
-Description=Sudomatic 5000 — Proxmox OIDC to Linux user sync
-After=network-online.target pve-cluster.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-EnvironmentFile=-{ENVFILE}
-EnvironmentFile=-{KEYFILE}
-ExecCondition={CHECKER}
-ExecStart=/usr/bin/python3 {SCRIPT_DST}
-User=root
-"""
-    SERVICE.write_text(service_unit)
-    fncOk(f"Wrote service unit: {SERVICE}")
-
-    timer_unit = """[Unit]
-Description=Run Sudomatic 5000 every 30 minutes
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=30min
-Unit=sudomatic.service
-AccuracySec=1min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-"""
-    TIMER.write_text(timer_unit)
-    fncOk(f"Wrote timer unit: {TIMER}")
+            + fncColor(f"systemctl daemon-reload && systemctl enable --now {TIMER.name}", "white", "bold"))
 
 def fncDoInstall():
     fncRequireRoot()
-    fncHeading("[*] Installing Sudomatic 5000...")
+    fncHeading("[*] Installing Entramox Reconciler...")
 
     fncInstallRequirements()
-    fncEnsureKeyfile()  # <<< generate the key first
+    fncEnsureKeyfile()  # generate key first
 
-    # Install Python script
     shutil.copy2(SCRIPT_SRC, SCRIPT_DST)
     os.chmod(SCRIPT_DST, 0o700)
     fncOk(f"Installed script to {SCRIPT_DST}")
 
-    # Calculate SHA256 and write checker
     expected_sha = fncSha256Sum(SCRIPT_DST)
     fncInfo(f"Calculated SHA256: {fncColor(expected_sha, 'white', 'bold')}")
     fncWriteChecker(expected_sha)
 
-    # Log directory
     LOGDIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     fncOk(f"Ensured log directory {LOGDIR}")
 
-    # Build env (this will encrypt using the key)
     env_content = fncBuildEnvfileContent()
     fncWriteEnvfile(env_content)
 
-    # Units
     fncWriteUnits()
 
-    # Enable timer
     fncRun(["systemctl", "daemon-reload"])
     fncOk("systemd daemon reloaded")
-    fncRun(["systemctl", "enable", "--now", "sudomatic.timer"])
-    fncOk("Enabled and started timer: sudomatic.timer")
+    fncRun(["systemctl", "enable", "--now", TIMER.name])
+    fncOk(f"Enabled and started timer: {TIMER.name}")
 
     fncOk("Installation complete.")
-    fncInfo("Check logs: " + fncColor("journalctl -u sudomatic.service -n 200 --no-pager", "white", "bold"))
-    fncInfo("Edit config: " + fncColor("/etc/sudomatic5000.env", "white", "bold")
-            + " then: " + fncColor("systemctl daemon-reload && systemctl restart sudomatic.service", "white", "bold"))
+    fncInfo("Check logs: " + fncColor(f"journalctl -u {SERVICE.name} -n 200 --no-pager", "white", "bold"))
+    fncInfo("Edit config: " + fncColor(str(ENVFILE), "white", "bold")
+            + " then: " + fncColor(f"systemctl daemon-reload && systemctl restart {SERVICE.name}", "white", "bold"))
 
 def fncDoUpdate(auto_restart: bool = False):
     fncRequireRoot()
-    fncHeading("[*] Updating Sudomatic 5000...]")
+    fncHeading("[*] Updating Entramox Reconciler...]")
+
+    # First: adopt any legacy files if present
+    fncMaybeAdoptLegacyArtifacts()
 
     if not SCRIPT_DST.exists():
-        fncErr("Installed script not found, did you run install first?")
+        fncErr("Installed script not found (new or adopted). Did you run install first?")
         sys.exit(1)
     if not SCRIPT_SRC.exists():
         fncErr(f"Local source not found: {SCRIPT_SRC}")
         sys.exit(1)
     if not CHECKER.exists():
-        fncErr("Checker not found, did you run install first?")
-        sys.exit(1)
+        fncWarn("Checker not found; it will be regenerated during update.")
+        # not fatal
 
-    # Ensure encryption key exists for potential migration
     fncEnsureKeyfile()
 
     local_sha = fncSha256Sum(SCRIPT_SRC)
@@ -876,7 +905,6 @@ def fncDoUpdate(auto_restart: bool = False):
     fncInfo(f"Local SHA     : {fncColor(local_sha, 'white', 'bold')}")
     fncInfo(f"Installed SHA : {fncColor(installed_sha, 'white', 'bold')}")
 
-    # ----- Offer to (re)generate /etc/sudomatic5000.env -----
     def ask_yes_no(prompt: str, default_yes: bool = False) -> bool:
         hint = "Y/n" if default_yes else "y/N"
         while True:
@@ -887,11 +915,10 @@ def fncDoUpdate(auto_restart: bool = False):
             if ans in ("n", "no"):  return False
             fncWarn("Please answer y or n.")
 
+    # Env handling (new envfile)
     if ENVFILE.exists():
-        if ask_yes_no("Re-run config wizard and overwrite /etc/sudomatic5000.env?", default_yes=False):
-            # Backup existing file
-            ts = __import__("datetime").datetime.now().strftime("%Y%m%d-%H%M%S")
-            backup = ENVFILE.with_suffix(ENVFILE.suffix + f".bak-{ts}")
+        if ask_yes_no(f"Re-run config wizard and overwrite {ENVFILE}?", default_yes=False):
+            backup = fncEnvBackupPath(ENVFILE)
             try:
                 shutil.copy2(ENVFILE, backup)
                 fncInfo(f"Backed up existing env to {fncColor(str(backup), 'white', 'bold')}")
@@ -901,16 +928,15 @@ def fncDoUpdate(auto_restart: bool = False):
             fncWriteEnvfile(content)
         else:
             fncInfo("Keeping existing env file.")
-            # Migrate plaintext -> encrypted in-place, remove deprecated vars
             fncEncryptIfNeededInEnv(ENVFILE)
     else:
-        if ask_yes_no("/etc/sudomatic5000.env not found. Create it now?", default_yes=True):
+        if ask_yes_no(f"{ENVFILE} not found. Create it now?", default_yes=True):
             content = fncBuildEnvfileContent()
             fncWriteEnvfile(content)
         else:
             fncWarn("Skipping env creation; service may not have credentials/config.")
 
-    # ----- Update script if needed -----
+    # Update script if needed
     if local_sha == installed_sha:
         fncWarn("Current installed version already matches local — no update needed.")
     else:
@@ -926,22 +952,43 @@ def fncDoUpdate(auto_restart: bool = False):
         fncWriteChecker(new_installed_sha)
         fncOk("Script updated and checksum refreshed.")
 
+    # Re-write units (ensures timer points at the right service name)
+    fncWriteUnits()
+
+    # Reload daemon to pick up any unit changes
+    fncRun(["systemctl", "daemon-reload"])
+    fncOk("systemd daemon reloaded")
+
+    # Disable legacy timer if it's still around (best-effort)
+    for unit in (LEGACY_TIMER.name, LEGACY_SERVICE.name):
+        try:
+            fncRun(["systemctl", "disable", "--now", unit])
+            fncInfo(f"Disabled legacy unit: {unit}")
+        except subprocess.CalledProcessError:
+            pass
+
+    # Ensure new timer is enabled
+    try:
+        fncRun(["systemctl", "enable", "--now", TIMER.name])
+        fncOk(f"Ensured timer enabled: {TIMER.name}")
+    except subprocess.CalledProcessError:
+        fncWarn(f"Could not enable/start timer {TIMER.name} (check systemd output).")
+
     if auto_restart:
-        fncRun(["systemctl", "restart", "sudomatic.service"])
+        fncRun(["systemctl", "restart", SERVICE.name])
         fncOk("Service restarted.")
     else:
         fncInfo("Restart the service with: "
-                + fncColor("sudo systemctl restart sudomatic.service", "white", "bold"))
+                + fncColor(f"sudo systemctl restart {SERVICE.name}", "white", "bold"))
 
 # ============================
 # Entry point
 # ============================
 def fncMain():
-    parser = argparse.ArgumentParser(description="Installer/Updater for Sudomatic 5000")
+    parser = argparse.ArgumentParser(description="Installer/Updater for Entramox Reconciler (with legacy Sudomatic migration)")
     parser.add_argument("action", choices=["install", "update", "uninstall"], help="Action to perform")
     parser.add_argument("--restart", action="store_true", help="Auto-restart service after update")
     parser.add_argument("--purge", action="store_true", help="Remove env, logs, and state without prompts (DANGEROUS)")
-    # If you later add a monochrome flag, call fncSetColorMode(args.blackandwhite) here.
     args = parser.parse_args()
 
     if args.action == "install":
