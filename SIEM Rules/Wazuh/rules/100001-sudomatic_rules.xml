@@ -1,179 +1,168 @@
 <!-- ================================================================
-  File    : sudomatic_rules.xml
-  Purpose : Sudomatic checker + app rules (compat: no correlations,
-            app rules key off base decoder with message regex)
+  File    : entramox_rules.xml
+  Purpose : Entramox Reconciler rules (compat: no correlations,
+            rules key off Entramox decoders / base decoder regex)
 ================================================================ -->
 
-<!-- ================= CHECKER (sudomatic_runner) ================= -->
-<group name="local,sudomatic,integrity,">
+<!-- ================= RECONCILER (entramoxreconciler) ================= -->
+<group name="local,entramox,reconciler,">
 
-  <!-- Critical: checksum mismatch -->
-  <rule id="1600" level="12">
-    <decoded_as>sudomatic-runner-checksum-fail</decoded_as>
-    <description>Sudomatic: Checksum mismatch â€“ potential tampering in $(path)</description>
-    <mitre><id>T1553</id><id>T1565</id></mitre>
-    <group>sudomatic,integrity,tamper,</group>
+  <!-- ---------------- Auth / Graph / Token ---------------- -->
+
+  <rule id="2600" level="10">
+    <decoded_as>entramox-reconciler-graph-creds-missing</decoded_as>
+    <description>Entramox: Graph credentials missing (tenant/client/secret not set)</description>
+    <mitre><id>T1552</id></mitre>
+    <group>entramox,auth,misconfig,</group>
   </rule>
 
-  <!-- Hard-fail conditions -->
-  <rule id="1610" level="11">
-    <decoded_as>sudomatic-runner-symlink</decoded_as>
-    <description>Sudomatic: Refusing to use symlink $(path)</description>
-    <group>sudomatic,integrity,hardening,</group>
+  <rule id="2601" level="9">
+    <decoded_as>entramox-reconciler-token-request-failed</decoded_as>
+    <description>Entramox: Token request failed (HTTP $(status))</description>
+    <group>entramox,auth,graph,error,</group>
   </rule>
 
-  <rule id="1611" level="10">
-    <decoded_as>sudomatic-runner-ownership</decoded_as>
-    <description>Sudomatic: $(path) not owned by root (uid=$(uid))</description>
-    <group>sudomatic,integrity,hardening,</group>
+  <rule id="2602" level="8">
+    <decoded_as>entramox-reconciler-token-response-missing</decoded_as>
+    <description>Entramox: Token response missing access_token</description>
+    <group>entramox,auth,graph,error,</group>
   </rule>
 
-  <rule id="1612" level="10">
-    <decoded_as>sudomatic-runner-perms</decoded_as>
-    <description>Sudomatic: $(path) permissions too broad (have $(mode), want â‰¤ 600)</description>
-    <group>sudomatic,integrity,hardening,</group>
+  <rule id="2603" level="9">
+    <decoded_as>entramox-reconciler-graph-call-failed</decoded_as>
+    <description>Entramox: Graph call failed ($(http_method)) (HTTP $(status))</description>
+    <group>entramox,graph,error,</group>
   </rule>
 
-  <!-- Warnings / drift -->
-  <rule id="1620" level="5">
-    <decoded_as>sudomatic-runner-missing</decoded_as>
-    <description>Sudomatic: Missing file $(path)</description>
-    <group>sudomatic,integrity,warning,</group>
+  <!-- ---------------- Run lifecycle / observability ---------------- -->
+
+  <rule id="2610" level="3">
+    <decoded_as>entramox-reconciler-run-start</decoded_as>
+    <description>Entramox: Reconcile started</description>
+    <group>entramox,run,</group>
   </rule>
 
-  <rule id="1621" level="6">
-    <decoded_as>sudomatic-runner-env-warn</decoded_as>
-    <description>Sudomatic: ENV checksum changed for $(path)</description>
-    <group>sudomatic,integrity,warning,</group>
+  <rule id="2611" level="3">
+    <decoded_as>entramox-reconciler-run-finish</decoded_as>
+    <description>Entramox: Reconcile finished (result=$(result))</description>
+    <group>entramox,run,</group>
   </rule>
 
-  <rule id="1622" level="6">
-    <decoded_as>sudomatic-runner-key-warn</decoded_as>
-    <description>Sudomatic: KEY checksum changed for $(path)</description>
-    <group>sudomatic,integrity,warning,</group>
+  <rule id="2612" level="3">
+    <decoded_as>entramox-reconciler-run-stats</decoded_as>
+    <description>Entramox: Run stats created=$(created) updated=$(updated) locked=$(locked) unlocked=$(unlocked) deleted=$(deleted) skipped=$(skipped)</description>
+    <group>entramox,run,telemetry,</group>
   </rule>
 
 </group>
 
-<!-- ================= APP (thelog.log) ================= -->
-<group name="local,sudomatic,account_management,">
+<!-- ================= ACCOUNT MANAGEMENT ================= -->
+<group name="local,entramox,account_management,">
 
   <!-- User lifecycle -->
-  <rule id="1700" level="7">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Created local user: [A-Za-z0-9_.-]+$</regex>
-    <description>Sudomatic: Local user created</description>
-    <group>user,provisioning,sudomatic,</group>
+  <rule id="2700" level="7">
+    <decoded_as>entramox-reconciler-user-create</decoded_as>
+    <description>Entramox: Local user created ($(dstuser))</description>
+    <group>user,provisioning,entramox,</group>
   </rule>
 
-  <rule id="1701" level="10">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Deleted user \(and home\): [A-Za-z0-9_.-]+$</regex>
-    <description>Sudomatic: Local user deleted (and home)</description>
-    <group>user,deprovisioning,sudomatic,</group>
+  <rule id="2701" level="10">
+    <decoded_as>entramox-reconciler-user-delete</decoded_as>
+    <description>Entramox: Local user deleted (and home) ($(dstuser))</description>
+    <group>user,deprovisioning,entramox,</group>
   </rule>
 
   <!-- Account lock/unlock -->
-  <rule id="1710" level="6">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Locked user: [A-Za-z0-9_.-]+$</regex>
-    <description>Sudomatic: Account locked</description>
-    <group>user,lock,sudomatic,</group>
+  <rule id="2710" level="6">
+    <decoded_as>entramox-reconciler-user-lock</decoded_as>
+    <description>Entramox: Account locked ($(dstuser))</description>
+    <group>user,lock,entramox,</group>
   </rule>
 
-  <rule id="1711" level="6">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Unlocked user: [A-Za-z0-9_.-]+$</regex>
-    <description>Sudomatic: Account unlocked</description>
-    <group>user,unlock,sudomatic,</group>
+  <rule id="2711" level="6">
+    <decoded_as>entramox-reconciler-user-unlock</decoded_as>
+    <description>Entramox: Account unlocked ($(dstuser))</description>
+    <group>user,unlock,entramox,</group>
   </rule>
 
-  <rule id="1712" level="6">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Initial password set and expired for [A-Za-z0-9_.-]+ \(not stored\)$</regex>
-    <description>Sudomatic: Initial password set &amp; expired</description>
-    <group>user,password,sudomatic,</group>
+  <rule id="2712" level="6">
+    <decoded_as>entramox-reconciler-initpass</decoded_as>
+    <description>Entramox: Initial password set &amp; expired ($(dstuser))</description>
+    <group>user,password,entramox,</group>
   </rule>
 
-  <!-- Privilege changes (sudo-specific) -->
-  <rule id="1720" level="9">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Added [A-Za-z0-9_.-]+ to group sudo$</regex>
-    <description>Sudomatic: Privilege grant â€” user added to sudo</description>
-    <group>privilege_escalation,sudo,sudomatic,</group>
+  <!-- Group membership changes -->
+  <rule id="2720" level="6">
+    <decoded_as>entramox-reconciler-group-add</decoded_as>
+    <description>Entramox: Group membership added ($(dstuser) -> $(group))</description>
+    <group>group_membership,entramox,</group>
   </rule>
 
-  <rule id="1721" level="8">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Removed [A-Za-z0-9_.-]+ from group sudo$</regex>
-    <description>Sudomatic: Privilege revoked â€” user removed from sudo</description>
-    <group>privilege_revocation,sudo,sudomatic,</group>
+  <rule id="2721" level="6">
+    <decoded_as>entramox-reconciler-group-remove</decoded_as>
+    <description>Entramox: Group membership removed ($(dstuser) -> $(group))</description>
+    <group>group_membership,entramox,</group>
+  </rule>
+
+  <!-- Privilege changes (sudo group specifically) -->
+  <rule id="2725" level="9">
+    <decoded_as>entramox-reconciler-group-add</decoded_as>
+    <match> to group sudo</match>
+    <description>Entramox: Privilege grant - user added to sudo ($(dstuser))</description>
+    <mitre><id>T1548</id></mitre>
+    <group>privilege_escalation,sudo,entramox,</group>
+  </rule>
+
+  <rule id="2726" level="8">
+    <decoded_as>entramox-reconciler-group-remove</decoded_as>
+    <match> from group sudo</match>
+    <description>Entramox: Privilege revoked - user removed from sudo ($(dstuser))</description>
+    <group>privilege_revocation,sudo,entramox,</group>
   </rule>
 
   <!-- Sudoers managed file changes -->
-  <rule id="1730" level="9">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Updated sudoers for [A-Za-z0-9_.-]+ at .+$</regex>
-    <description>Sudomatic: Sudoers file updated</description>
-    <group>sudoers_change,sudomatic,</group>
+  <rule id="2730" level="9">
+    <decoded_as>entramox-reconciler-sudoers-update</decoded_as>
+    <description>Entramox: Sudoers file updated ($(dstuser) @ $(path))</description>
+    <group>sudoers_change,entramox,</group>
   </rule>
 
-  <rule id="1731" level="8">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Removed sudoers file for [A-Za-z0-9_.-]+$</regex>
-    <description>Sudomatic: Sudoers file removed</description>
-    <group>sudoers_change,sudomatic,</group>
+  <rule id="2731" level="8">
+    <decoded_as>entramox-reconciler-sudoers-remove</decoded_as>
+    <description>Entramox: Sudoers file removed ($(dstuser))</description>
+    <group>sudoers_change,entramox,</group>
+  </rule>
+
+  <rule id="2732" level="9">
+    <decoded_as>entramox-reconciler-visudo-fail</decoded_as>
+    <description>Entramox: visudo validation failed ($(dstuser))</description>
+    <group>sudoers_change,error,entramox,</group>
   </rule>
 
   <!-- Deprovision lifecycle -->
-  <rule id="1740" level="6">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^User [A-Za-z0-9_.-]+ not in Entra allow-groups; locked and marked for deletion in .+$</regex>
-    <description>Sudomatic: User marked for deletion after grace</description>
-    <group>deprovisioning,sudomatic,</group>
+  <rule id="2740" level="6">
+    <decoded_as>entramox-reconciler-not-in-allowgroups</decoded_as>
+    <description>Entramox: User not in allow-groups; locked and marked for deletion ($(dstuser))</description>
+    <group>deprovisioning,entramox,</group>
   </rule>
 
-  <rule id="1741" level="10">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^User [A-Za-z0-9_.-]+ disabled for >= .+; deleting$</regex>
-    <description>Sudomatic: User deleted after grace period</description>
-    <group>deprovisioning,sudomatic,</group>
-  </rule>
-
-  <!-- PVE visibility -->
-  <rule id="1750" level="4">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^PVE user created: .+ \(enable=[0-9]\)$</regex>
-    <description>Sudomatic: PVE user created</description>
-    <group>pve,provisioning,sudomatic,</group>
-  </rule>
-
-  <rule id="1751" level="4">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^PVE user .+ set enable=[0-9]$</regex>
-    <description>Sudomatic: PVE user enable toggled</description>
-    <group>pve,sudomatic,</group>
-  </rule>
-
-  <rule id="1752" level="5">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^PVE ACL ensured: .+ @ .+ role=.+$</regex>
-    <description>Sudomatic: PVE ACL ensured</description>
-    <group>pve,acl,sudomatic,</group>
+  <rule id="2741" level="10">
+    <decoded_as>entramox-reconciler-deleted-after-grace</decoded_as>
+    <description>Entramox: User deleted after grace period ($(dstuser))</description>
+    <group>deprovisioning,entramox,</group>
   </rule>
 
   <!-- Operational issues -->
-  <rule id="1760" level="8">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^Missing required binary: [A-Za-z0-9_.-]+ -> .+$</regex>
-    <description>Sudomatic: Missing required binary</description>
-    <group>operational,sudomatic,</group>
+  <rule id="2760" level="8">
+    <decoded_as>entramox-reconciler-missing-bin</decoded_as>
+    <description>Entramox: Missing required binary ($(bin_key) -> $(bin_path))</description>
+    <group>operational,entramox,</group>
   </rule>
 
-  <rule id="1761" level="9">
-    <decoded_as>sudomatic-app</decoded_as>
-    <regex>^visudo validation failed for [A-Za-z0-9_.-]+: .+$</regex>
-    <description>Sudomatic: visudo validation failed</description>
-    <group>sudoers_change,error,sudomatic,</group>
+  <rule id="2765" level="12">
+    <decoded_as>entramox-reconciler-exception</decoded_as>
+    <description>Entramox: Unhandled exception</description>
+    <group>error,exception,entramox,</group>
   </rule>
+
 </group>
