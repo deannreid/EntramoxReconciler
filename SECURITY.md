@@ -1,115 +1,204 @@
-# Security Policy — **Sudomatic 5000**
+# Security Policy - Entramox Reconciler
 
 **Turning realms into real users, one sudo at a time.**
 
-This document explains how to report vulnerabilities, what is in scope, our triage timelines, and which versions receive security fixes.
+This document explains how to report security issues, what is in scope, expected triage timelines, and which versions of Entramox Reconciler receive security fixes.
 
 ---
 
 ## Supported Versions
 
-| Version     | Supported?             |
-| ----------- | ---------------------- |
-| **1.3.x**   | ✅ Security fixes       |
-| **1.3.x**   | ⚠️ Critical fixes   |
-| ≤ **1.2.x** | ❌ End of support       |
+| Version     | Supported?            |
+| ----------- | --------------------- |
+| **2.0.x**   | ✅ Security fixes      |
+| **1.4.x**   | ⚠️ Critical fixes only |
+| ≤ **1.3.x** | ❌ End of support      |
 
-> I use semantic versioning. Minor releases (e.g., 1.4.x) receive security updates; older lines are deprecated as new minors are cut.
+Entramox Reconciler follows semantic versioning.  
+The latest major version receives full security fixes.  
+Previous majors receive critical fixes only for a limited time.
 
 ---
 
 ## Scope
 
-**In scope**
+### In scope
 
-* The Sudomatic 5000 Python script(s)
-* Example systemd service/timer units
-* Installation & hardening guidance documented in this repo
+* Entramox Reconciler Python code
+* Installer and update logic
+* systemd service and timer units provided by this repository
+* Integrity, permission, and safety guardrails implemented by the project
+* Documentation that impacts security posture or safe operation
 
-**Out of scope**
+### Out of scope
 
 * Proxmox VE itself and official tooling (`pve*`, `pvesh`, `pveum`)
-* Your OS/distro packages and kernel
-* Microsoft Graph / Entra ID and any external IdP
-* Third-party libraries and tools
+* Linux distributions, kernels, or system packages
+* Microsoft Entra ID, Microsoft Graph, or external identity providers
+* Third party Python libraries or system utilities
 
-If you’re unsure whether something is in scope, report it anyway I'll help route it.
+If you are unsure whether something is in scope, report it anyway and it will be triaged appropriately.
 
 ---
 
 ## Reporting a Vulnerability
 
-Please **do not open a public issue** for security reports.
+Please **do not open a public GitHub issue** for security related reports.
 
-* **Preferred:** Create a **private security advisory** in GitHub (Security → Advisories → “Report a vulnerability”)
+### Preferred method
 
-Include (as applicable):
+* Create a **private GitHub Security Advisory**
+  * Repository → Security → Advisories → Report a vulnerability
 
-* A clear description of the issue and potential impact
-* Steps to reproduce / PoC (minimal & deterministic)
-* Affected version(s) and environment (OS, Python version, Proxmox version)
-* Logs or stack traces (scrub secrets, tokens, usernames)
-* Any temporary mitigations/workarounds you’ve identified
+### Include the following where applicable
 
-I offer **safe-harbor** for good-faith research and coordinated disclosure. Please avoid testing against production systems you don’t own or have permission to test.
+* Clear description of the issue and impact
+* Steps to reproduce or proof of concept
+* Affected version(s)
+* Environment details (OS, Python version, Proxmox version)
+* Relevant logs or stack traces (remove secrets and identifiers)
+* Any known mitigations or workarounds
+
+Good faith security research is welcomed.  
+Please do not test against systems you do not own or have permission to assess.
 
 ---
 
 ## Vulnerability Handling Process
 
-**Acknowledgment:** within **2 business days**
-**Triage & initial assessment:** within **5 business days**
-**Fix development & advisory:** within **30 days** for High/Critical; otherwise as soon as practical
-**Coordinated disclosure:** I'll agree a timeline with you; Critical issues may be fast-tracked
+* **Acknowledgement:** within 2 business days
+* **Triage and initial assessment:** within 5 business days
+* **Fix and advisory publication:**  
+  * High or Critical severity within 30 days  
+  * Medium or Low severity as soon as practical
+* **Coordinated disclosure:** agreed with the reporter
 
-I classify severity using **CVSS v3.1** and GitHub’s severity levels. Where appropriate I will publish a **GitHub Security Advisory (GHSA)** and request a **CVE ID**.
+Severity is assessed using CVSS v3.1 and GitHub severity guidance.  
+Where appropriate, a GitHub Security Advisory will be published and a CVE requested.
 
-Credit is given to reporters who request it, unless anonymity is preferred.
+Reporter credit is provided on request.
 
 ---
 
-## Security Expectations & Hardening (for Operators)
+## Security Expectations for Operators
 
-Sudomatic 5000 manipulates local accounts and sudoers; run it **defensively**:
+Entramox Reconciler manages local users, groups, sudoers, and Proxmox access.  
+It must be operated defensively.
 
-* **Run as root** only from a trusted path.
-* **Lock down file permissions:**
+### File ownership and permissions
 
-  * Script file: `chmod 700`, owner `root:root`
-  * Log dir (default `/var/log/sudomatic5000`): `chmod 750`, owner `root:root`
-  * State dir (default `/var/lib/sudomatic5000`): `chmod 750`, owner `root:root`
-  * Managed sudoers files: `chmod 440`, owner `root:root`
-* **Pinned binaries:** keep `BIN` paths accurate for your distro to avoid PATH hijacking.
-* **Privileged config guard:** keep `fncScriptSecurityCheck()` intact; the script will refuse to grant sudo if this gate is missing/failing.
-* **Avoid `NOPASSWD`:** leave `SUDO_NOPASSWD = False` unless you absolutely know what you’re doing.
-* **Groups:** treat `"sudo"`, `"wheel"`, `"admin"` as privileged—restrict membership.
-* **Graph creds:** store in protected environment (systemd `Environment=` or drop-in with root-only perms). Never commit secrets.
-* **Systemd:** run via a **timer** (e.g., every 30 minutes), not as a long-running root process.
+* Script file  
+  `/usr/local/sbin/entramoxreconciler.py`  
+  `root:root`, mode `0700`
+
+* Integrity checker  
+  `/usr/local/sbin/entramox_check.sh`  
+  `root:root`, mode `0700`
+
+* Config file  
+  `/etc/entramoxreconciler.env`  
+  `root:root`, mode `0600`
+
+* Encryption key  
+  `/etc/entramoxreconciler.key`  
+  `root:root`, mode `0600`
+
+* Log directory  
+  `/var/log/entramoxreconciler`  
+  `root:root`, mode `0750`
+
+* State directory  
+  `/var/lib/entramoxreconciler`  
+  `root:root`, mode `0750`
+
+* Managed sudoers files  
+  `/etc/sudoers.d/*`  
+  `root:root`, mode `0440`
+
+---
+
+### Integrity enforcement
+
+Entramox Reconciler enforces integrity at runtime:
+
+* SHA-256 checksum validation of the installed script
+* Refusal to execute if permissions or ownership are unsafe
+* systemd `ExecCondition` gate before execution
+
+If these checks fail, the service exits without making changes.
+
+Do not bypass or remove these checks.
+
+---
+
+### Execution model
+
+* Always run via **systemd timer**
+* Never run as a long lived root daemon
+* Never run from user writable paths
+* Avoid cron unless you fully understand locking and environment behaviour
+
+---
+
+### Privilege and sudo guidance
+
+* Avoid `NOPASSWD` unless absolutely required
+* Treat `sudo`, `wheel`, and `admin` as highly privileged groups
+* Sudo access should normally be granted only via Entra Super Admin groups
+* All sudoers files are validated with `visudo` before being applied
+
+---
+
+### Entra and Graph credentials
+
+* Store secrets only in root protected locations
+* Prefer encrypted secrets in the env file
+* Never commit secrets to the repository
+* Rotate client secrets regularly
+* Use application credentials for timers and automation
 
 ---
 
 ## Responsible Disclosure
 
-* Please keep reports **private** until a fix or mitigation is available.
-* I'll coordinate a disclosure date; if I cannot meet timelines I'll communicate status and interim mitigations.
-* If I disagree on impact/scope, I'll explain why and continue the conversation in good faith.
+* Keep reports private until fixes or mitigations are available
+* Coordinated disclosure timelines will be agreed together
+* If timelines cannot be met, status and mitigations will be communicated
+* Disagreements on severity or scope will be handled transparently
 
-I do not currently run a paid bug bounty. Meaningful, actionable reports will be recognized in release notes (with permission).
-
----
-
-## Dependencies & Supply Chain
-
-If the issue is in a **dependency** (Python stdlib / OS tools / Proxmox / Graph), please report it to the upstream project and notify us so I can ship mitigations or version pins where required.
+There is currently no paid bug bounty.  
+High quality reports may be acknowledged in release notes with permission.
 
 ---
 
-## Non-Vulnerability Security Issues
+## Dependencies and Supply Chain
 
-Operational misconfiguration (e.g., enabling `NOPASSWD`, overly broad `ALLOID_UPN_DOMAINS`, or running from world-writable locations) is not a software vulnerability. I still welcome reports that improve **docs, defaults, or guardrails**.
+If a vulnerability exists in:
+
+* Proxmox VE
+* Linux system tools
+* Microsoft Entra ID or Graph
+* Python standard library or third party modules
+
+Please report it to the upstream project and notify this repository so mitigations or guidance can be added if appropriate.
+
+---
+
+## Non Vulnerability Security Issues
+
+Operational misconfiguration is not a software vulnerability, but reports that improve defaults, guardrails, or documentation are welcome.
+
+Examples include:
+
+* Overly permissive sudo settings
+* Unsafe environment file handling
+* Risky username mapping defaults
+* Ambiguous documentation
 
 ---
 
 ## Policy Updates
 
-This policy may change over time. The **SECURITY.md** in the main branch is the authoritative version. Significant changes will be noted in release notes.
+This security policy may change over time.  
+The `SECURITY.md` file in the main branch is the authoritative version.  
+Significant changes will be noted in release notes.
