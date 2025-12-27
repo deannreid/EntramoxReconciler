@@ -1,275 +1,329 @@
-# Sudomatic 5000
+# Entramox Reconciler
 
 ***Turning realms into real users, one sudo at a time.***
 
-Sync OIDC users from **Proxmox VE** into real **Linux** accounts: create local users, set a random (expired) password, manage groups/sudoers idempotently, and handle removals (lock → delete after 24h). Logs live at `/var/log/sudomatic5000/thelog.log`. Safe-by-default: reserved accounts are never touched, binaries are pinned, and runs are lockfile-protected.
+Entramox Reconciler syncs OIDC users from **Proxmox VE** into real **Linux** accounts, with optional enforcement from **Microsoft Entra ID (Graph)**.
+
+It creates local users, sets a random expired password, manages groups and sudoers idempotently, and handles leavers with a lock then delete lifecycle. It also keeps **Proxmox (PVE) users** aligned, including enable or disable state, ACL roles, and metadata.
+
+Logs are written to:
+
+```
+
+/var/log/entramoxreconciler/thelog.log
+
+````
+
+The service is safe by default. Reserved system accounts are never touched, binaries are pinned, integrity is enforced, and runs are protected by a lockfile.
 
 ---
+
 ## ⚠️ Casual Cyber Warning
 
-> **This script will refuse to start unless it’s `root:root` and `0700`.**
-> That’s intentional—so nobody can swap it and mint sudo. The service also uses an **ExecCondition checksum guard**: `/usr/local/sbin/sudomatic_check.sh` verifies the **SHA-256** of `/usr/local/sbin/sudomatic5000.py` captured at install/update.
-> **If the file changes on disk, the checksum fails and the service will not run.**
+> **This script will refuse to start unless it is owned by `root:root` and has `0700` permissions.**
+> That is intentional, so nobody can swap it and mint sudo.
 >
-> **Before enabling the service or timer, enforce correct ownership and permissions:**
+> The systemd service uses an **ExecCondition integrity check**.  
+> A helper script verifies the **SHA-256 checksum** of:
 >
-> ```bash
-> sudo chown root:root /usr/local/sbin/sudomatic5000.py /usr/local/sbin/sudomatic_check.sh
-> sudo chmod 700        /usr/local/sbin/sudomatic5000.py /usr/local/sbin/sudomatic_check.sh
-> sudo install -d -m 0750 -o root -g root /var/log/sudomatic5000
-> sudo install -d -m 0750 -o root -g root /var/lib/sudomatic5000
-> ```
+> * `/usr/local/sbin/entramoxreconciler.py`
+> * `/etc/entramoxreconciler.env`
+> * `/etc/entramoxreconciler.key`
 >
-> **Service must run as root** and paths must not be world-writable. Never place the script in user-writable locations (`/tmp`, `$HOME`, shared mounts, etc.).
->
-> **Need to change the code?** Do **not** edit the installed file directly. Update from your repo and let the installer refresh the checksum:
->
-> ```bash
-> # replace sudomatic5000.py in your repo working dir, then:
-> sudo ./installer.py update --restart
-> ```
->
-> If ownership, permissions, or checksum don’t match, the script **actively exits** to prevent privilege-escalation via file tampering.
+> If the script checksum does not match what was captured during install or update, **the service will not run**.
+
+Before enabling the service or timer, ensure permissions are correct:
+
+```bash
+sudo chown root:root /usr/local/sbin/entramoxreconciler.py /usr/local/sbin/entramox_check.sh
+sudo chmod 700        /usr/local/sbin/entramoxreconciler.py /usr/local/sbin/entramox_check.sh
+sudo install -d -m 0750 -o root -g root /var/log/entramoxreconciler
+sudo install -d -m 0750 -o root -g root /var/lib/entramoxreconciler
+````
+
+**The service must run as root.**
+Do not place the script or env files in user writable locations.
+
+To update the code, do **not** edit the installed file directly. Update from the repo and refresh the checksum:
+
+```bash
+sudo ./installer.py update --restart
+```
+
+If ownership, permissions, or checksums do not match, the script exits immediately to prevent privilege escalation.
+
+---
+
+## What Entramox Reconciler does
+
+For each run:
+
+* Reads users from the configured **Proxmox OIDC realm**
+* Optionally intersects them with one or more **Entra ID groups**
+* Maps UPNs to local Unix usernames using configurable rules
+* Creates missing local users and expires their passwords
+* Manages baseline groups and sudo access idempotently
+* Disables PVE users when Entra users are disabled
+* Locks users removed from the desired set
+* Deletes locked users after a configurable grace period
+* Updates Proxmox user comments to reflect lifecycle state
 
 ---
 
 ## Quick start
 
+### Supported authentication models
 
-### What you must grant (permissions)
+Entramox Reconciler supports **two Graph authentication modes**:
 
-### Application (app-only, used by Sudomatic service)
+1. **Application credentials (recommended)**
 
-> These are **required** for the client-credentials flow the service uses.
+   * Uses client credentials
+   * Safe for timers and unattended execution
 
-* **GroupMember.Read.All** *(Application)* — **required** to list group members
-* **User.Read.All** *(Application)* — **required** to read `userPrincipalName` / `mail`
-* *(Optional, only if your group uses hidden membership)* **Member.Read.Hidden** *(Application)*
+2. **Delegated access token**
 
-### Delegated (optional; only if you want user sign-in flows)
-
-> Not used by the Sudomatic service. Helpful if you test with your own user token or build UI flows.
-
-* **email**, **openid**, **profile** *(Delegated)* — needed if you want users to sign in interactively (e.g., web/app auth)
-* *(Optional for debugging)* **GroupMember.Read.All** *(Delegated)* — lets your **personal** token read memberships in Graph Explorer/Azure CLI
+   * Useful for testing
+   * Short lived and not suitable for timers
 
 ---
 
-## Portal steps (quick)
+## Required Entra permissions
 
-1. **Register the app**
-   Entra ID → **App registrations** → **New registration** → Name: `Sudomatic 5000` → Single tenant → **Register**
+### Application permissions (service mode)
 
-2. **Create a client secret**
-   App → **Certificates & secrets** → **New client secret** → copy the **Value**
+These are required when using client credentials:
 
-3. **Add Application permissions**
-   App → **API permissions** → **Add a permission** → **Microsoft Graph** → **Application permissions**
-   Add:
+* **GroupMember.Read.All**
+* **User.Read.All**
+* Optional: **Member.Read.Hidden** (only if group membership is hidden)
 
-   * `GroupMember.Read.All`
-   * `User.Read.All`
-   * *(Optional)* `Member.Read.Hidden`
-     Click **Grant admin consent**.
+Admin consent is required.
 
-4. **Collect IDs**
+### Delegated permissions (optional)
 
-   * **Tenant ID** (Directory ID)
-   * **Application (client) ID**
-   * **Group Object ID** for the group you want to enforce
+Only needed for interactive testing:
+
+* **email**
+* **openid**
+* **profile**
+* Optional: **GroupMember.Read.All**
 
 ---
 
-## Plug creds into the service (two ways)
+## Entra portal steps
 
-### A) Edit the systemd service env
+1. Register an app
+   Entra ID → App registrations → New registration
+   Single tenant is sufficient
+
+2. Create a client secret
+   Certificates and secrets → New client secret
+
+3. Add API permissions
+   Microsoft Graph → Application permissions
+   Grant admin consent
+
+4. Collect the following values:
+
+   * Tenant ID
+   * Client ID
+   * Client secret
+   * Entra group Object IDs
+
+---
+
+## Installation
+
+### First time install
 
 ```bash
-sudo systemctl edit sudomatic.service
-```
-
-Add under `[Service]`:
-
-```ini
-[Service]
-Environment=ENTR_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-Environment=ENTR_CLNT_ID=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
-Environment=ENTR_CLNT_SEC=your-super-secret
-Environment=ENTR_SUPERUSR_ID=75a68561-7a39-4eef-9a59-d9666d7533b3
-```
-
-Then:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart sudomatic.service
-```
-
-### B) **Re-run the installer** (it will write/update the service env for you)
-
-```bash
-# First-time installation (deploys script, checker, service, and timer)
 sudo ./installer.py install
+```
 
-# Updating later
+This will:
+
+* Install Python dependencies
+* Deploy the script and checker
+* Generate an encryption key
+* Create `/etc/entramoxreconciler.env`
+* Write systemd service and timer
+* Enable and start the timer
+
+### Update existing install
+
+```bash
 sudo ./installer.py update
-sudo ./installer.py update --restart   # optional auto-restart
+sudo ./installer.py update --restart
 ```
 
-> Either approach is fine. If you used A) earlier and swap to B), the installer will overwrite with whatever you provide there.
+Legacy **sudomatic5000** installs are detected and migrated automatically.
 
----
-
-## Sanity check (app token path the service uses)
+### Uninstall
 
 ```bash
-TENANT="$ENTR_TENANT_ID"
-CLIENT="$ENTR_CLNT_ID"
-SECRET="$ENTR_CLNT_SEC"
-
-ACCESS_TOKEN=$(curl -sS -X POST "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "client_id=$CLIENT" \
-  -d "client_secret=$SECRET" \
-  -d "grant_type=client_credentials" \
-  -d "scope=https%3A%2F%2Fgraph.microsoft.com%2F.default" \
-  | jq -r .access_token)
-
-GROUP_ID="$ENTR_SUPERUSR_ID"
-curl -sS -H "Authorization: Bearer $ACCESS_TOKEN" -H "Accept: application/json" \
-  "https://graph.microsoft.com/v1.0/groups/$GROUP_ID/members/microsoft.graph.user?\$select=id,displayName,userPrincipalName&\$top=999" \
-| jq -r '.value[] | select(.userPrincipalName!=null) | .userPrincipalName'
-```
-
-* If you get **403 Authorization_RequestDenied** → admin consent or permissions missing.
-* If UPNs are **null** → add **User.Read.All (Application)** and consent.
-* Hidden membership group? Add **Member.Read.Hidden (Application)** and consent.
-
----
-
-## Logs & behavior
-
-```bash
-journalctl -u sudomatic.service -f
-```
-
-* If Graph fails or perms are wrong, Sudomatic **fails open**: it logs a **warning** and **does not** add/remove/lock users for that run (relies on Proxmox only).
-* When permissions are correct, you’ll see:
-  `Graph: group '...' members fetched (STRICT UPN): kept=N, ...`
-
-That’s it—grant the **Application** roles, plug env into the service (or re-run the installer), and Sudomatic 5000 will sync exactly the group’s **userPrincipalName** members.
-
-
-
-### Application Install
-```bash
-# First-time install (deploys script, env file, checker, service & timer)
-sudo ./installer.py install
-
-# Logs
-journalctl -u sudomatic.service -n 200 --no-pager
-
-# Update the installed script (idempotent)
-sudo ./installer.py update
-sudo ./installer.py update --restart   # update + restart service
-
-# Uninstall everything the installer created
 sudo ./installer.py uninstall
 ```
 
----
-
-## Configuration (env-first)
-
-Sudomatic is **env-driven** at runtime. The installer writes `/etc/sudomatic5000.env`, and the systemd service loads it via `EnvironmentFile=`. Anything set there **overrides** the in-code defaults.
-
-**Edit:**
+To fully purge config, logs, and state:
 
 ```bash
-sudoedit /etc/sudomatic5000.env
-sudo systemctl daemon-reload
-sudo systemctl restart sudomatic.service
+sudo ./installer.py uninstall --purge
 ```
 
-### Minimal env example
+---
+
+## Configuration model
+
+Entramox Reconciler is **env driven**.
+
+The primary config file is:
+
+```
+/etc/entramoxreconciler.env
+```
+
+It must be owned by root and have `0600` permissions.
+
+Edit it safely:
+
+```bash
+sudoedit /etc/entramoxreconciler.env
+sudo systemctl daemon-reload
+sudo systemctl restart entramoxreconciler.service
+```
+
+---
+
+## Minimal configuration example
 
 ```ini
-# --- Core ---
-REALM='MY-REALM'                   # Must match Proxmox exactly
+REALM='MY-REALM'
 DEFAULT_SHELL='/bin/bash'
-EXTRA_GROUPS='sudo'                # space or comma separated; empty = none
-GRANT_SUDO='true'                  # true|false
-SUDO_NOPASSWD='false'              # true|false
-ALLOWED_UPN_DOMAINS='example.com sub.example.com'   # empty = allow all
 
-# --- Microsoft Graph enforcement (optional) ---
-GRAPH_ENFORCE='true'               # intersect with group members (strict UPN)
-GRAPH_FAIL_OPEN='true'             # on Graph error: make no user changes
-ENTR_SUPERUSR_ID='00000000-0000-0000-0000-000000000000'
+GRAPH_ENFORCE='true'
+GRAPH_FAIL_OPEN='true'
 
-# App-only token (recommended for service)
+ALLOWED_UPN_DOMAINS='example.com sub.example.com'
+
+ENTRA_ALLUSERS_GROUP_ID='00000000-0000-0000-0000-000000000000'
+ENTRA_ALLUSERS_PVE_ROLE='PVEUser'
+
+ENTRA_SUPERADMIN_GROUP_ID='11111111-1111-1111-1111-111111111111'
+ENTRA_SUPERADMIN_PVE_ROLE='Administrator'
+
 ENTR_TENANT_ID='tenant-guid'
-ENTR_CLNT_ID='app-client-guid'
-ENTR_CLNT_SEC='super-secret'
-
-# OR delegated test token (short-lived; not for timers)
-# GRAPH_ACCESS_TOKEN='eyJ0eXAiOiJKV1Qi…'
+ENTR_CLNT_ID='client-guid'
+ENTR_CLNT_SEC_ENC='fernet:...'
 ```
 
-> The **“Tweakers”** block in `sudomatic5000.py` still exists, but serves as **fallback defaults**. Env wins at runtime.
+---
+
+## Username mapping behaviour
+
+Username mapping is configurable:
+
+* `USERNAME_MODE=useronly`
+  `user@domain.com` → `user`
+
+* `USERNAME_MODE=upn_concat`
+  `user@domain.com` → `user_domain.com`
+
+Additional controls:
+
+* `USERNAME_SEPARATOR`
+* `USERNAME_LOWERCASE`
+* `USERNAME_MAXLEN`
+
+All usernames are sanitised before creation.
 
 ---
 
-## What each knob does (quick)
+## Lifecycle behaviour
 
-* `REALM` — Proxmox realm name (must match PVE or nothing syncs).
-* `DEFAULT_SHELL` — shell for new users.
-* `EXTRA_GROUPS` — extra groups to add; empty to skip.
-* `GRANT_SUDO` / `SUDO_NOPASSWD` — per-user sudoers in `/etc/sudoers.d` (validated with `visudo -cf`).
-* `ALLOWED_UPN_DOMAINS` — only accept UPNs from these domains (empty = allow all).
-* `GRAPH_ENFORCE` — require membership in `ENTR_SUPERUSR_ID` (strict UPN) **and** presence in PVE realm.
-* `GRAPH_FAIL_OPEN` — if Graph errors, don’t disable/delete anyone this run.
-* `ENTR_TENANT_ID`, `ENTR_CLNT_ID`, `ENTR_CLNT_SEC` — app-only auth for Graph; preferred for the timer.
-* `GRAPH_ACCESS_TOKEN` — delegated bearer for quick testing (short-lived).
+### Desired users
 
-**Permissions (Entra → App Registration → API permissions → Application):**
+A user is desired if:
 
-* `GroupMember.Read.All` (required)
-* `User.Read.All` (required)
-* `Member.Read.Hidden` (only if the group hides membership)
-* For delegated testing: add `email`, `openid`, `profile` (Delegated)
+* They exist in the configured Proxmox realm
+* AND they are a member of at least one enforced Entra group (when enabled)
+* AND their UPN domain is allowed
 
-> Current release note: **Graph enforcement is safe and fail-open**, but user disable/delete still relies on removal from **PVE** realm while Graph support matures.
+### Entra disabled users
 
----
+If an Entra account is disabled but still in the group:
 
-## How it behaves
+* Local account is locked
+* Sudo is revoked
+* PVE user is disabled
+* No deletion countdown is started
 
-* **Create** missing users (from PVE realm ∩ Graph group if enabled), set random password, **expire** it.
-* **Idempotent** group add & sudoers update.
-* **Leavers**: if a user disappears from desired set → **lock** immediately → **delete** after `DELETE_AFTER`.
-* **Never touches** `RESERVED_USERS` (root, www-data, etc).
-* **Binary pinning**: uses exact paths (defense-in-depth).
-* **Lockfile**: prevents overlapping runs.
-* **Logs**: `/var/log/sudomatic5000/thelog.log` (installer can drop a logrotate file).
+This state is reversible.
 
----
+### Group removal
 
-## Troubleshooting (rapid-fire)
+If a user leaves all allowed groups:
 
-* **No users found**: check `REALM` spelling, and that users actually exist in PVE (`pvesh get /access/users`).
-* **Graph shows 403**: ensure Application perms (`GroupMember.Read.All`, `User.Read.All`) and Admin consent granted.
-* **Everyone filtered**: set `ALLOWED_UPN_DOMAINS` to your tenant’s UPN suffix(es) or leave empty.
-* **Sudo not granted**: script must be `root:root 0700`; the built-in security gate refuses to create sudoers otherwise.
-* **Service not seeing env**: `systemctl show sudomatic.service -p EnvironmentFiles -p Environment`.
+* Local account is locked immediately
+* Sudo is revoked
+* PVE user is disabled
+* User enters a grace period
+* Proxmox comment is updated with remaining time
+* User is deleted after `DELETE_AFTER`
 
 ---
 
-## Uninstall
+## Logging and visibility
+
+Logs are written to:
+
+```
+/var/log/entramoxreconciler/thelog.log
+```
+
+Journal view:
 
 ```bash
-sudo ./installer.py uninstall
-# removes: service + timer + checker + script + env file (keeps logs/state)
+journalctl -u entramoxreconciler.service -f
 ```
+
+Logrotate is installed automatically.
+
+---
+
+## Safety features
+
+* Root ownership enforcement
+* Strict file permissions
+* SHA-256 integrity checks
+* Atomic file writes
+* Lockfile to prevent concurrent runs
+* Reserved users are never touched
+* Fail open or fail closed Graph behaviour is configurable
+
+---
+
+## Troubleshooting
+
+* No users synced
+  Check `REALM` matches Proxmox exactly
+
+* Graph 403 errors
+  Verify permissions and admin consent
+
+* Users never deleted
+  Check `GRAPH_FAIL_OPEN` and grace period
+
+* Sudo not applied
+  Confirm `GRANT_SUDO=true` and user is in superadmin group
+
+* Service not reading env
+  Run:
+
+  ```bash
+  systemctl show entramoxreconciler.service -p EnvironmentFiles -p Environment
+  ```
+
+
 
 Enjoy the realm wrangling 🧙‍♂️

@@ -18,7 +18,7 @@ from datetime import datetime
 ROOT_DIR = Path(__file__).resolve().parent
 SCRIPT_SRC = ROOT_DIR / "entramoxreconciler.py"
 REQS = ROOT_DIR / "requirements.txt"
-VERSION = "1.4.1a"
+VERSION = "2.0.0a"
 
 # ============================================================
 # NEW: entramoxreconciler (current installation target)
