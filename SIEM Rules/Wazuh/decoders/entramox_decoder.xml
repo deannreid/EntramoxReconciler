@@ -1,0 +1,394 @@
+<!-- ================================================================
+  File    : entramox_decoder.xml
+  Purpose : Program-specific decoders for Entramox Reconciler
+  Notes   : All decoders anchored to program_name '^entramoxreconciler$'
+            to avoid collisions with generic python/system decoders.
+            Uses OSRegex / POSIX ERE only.
+  V2.5    : Added decoders for tiered accounts, PBS, PDM, remote API
+            errors, and JSON audit log events.
+================================================================ -->
+
+<!-- ============================
+     ENTRAMOX RECONCILER DECODERS
+     (anchored to service name — no collisions)
+     ============================
+
+  Required Wazuh ossec.conf entries:
+
+  <!-- Main application log (text) -->
+  <localfile>
+    <log_format>syslog</log_format>
+    <location>/var/log/entramoxreconciler/thelog.log</location>
+  </localfile>
+
+  <!-- Structured JSON audit log (v2.5+) -->
+  <localfile>
+    <log_format>json</log_format>
+    <location>/var/log/entramoxreconciler/audit.log</location>
+    <label key="program_name">entramox-audit</label>
+  </localfile>
+-->
+
+<decoder name="entramox-reconciler">
+  <program_name>^entramoxreconciler$</program_name>
+  <regex>^(.+)$</regex>
+  <order>msg</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Credential / Auth / Token handling
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-graph-creds-missing">
+  <parent>entramox-reconciler</parent>
+  <regex>^Graph creds missing: set one of (.+) or \(([^,]+),([^,]+),([^)]+)\)$</regex>
+  <order>token_env_fallbacks, env_tenant_id, env_client_id, env_client_secret</order>
+</decoder>
+
+<decoder name="entramox-reconciler-token-request-failed">
+  <parent>entramox-reconciler</parent>
+  <regex>^Token request failed: status=([0-9]{3}) err=(.+)$</regex>
+  <order>status, err</order>
+</decoder>
+
+<decoder name="entramox-reconciler-token-response-missing">
+  <parent>entramox-reconciler</parent>
+  <regex>^Token response missing access_token$</regex>
+  <order>msg</order>
+</decoder>
+
+<decoder name="entramox-reconciler-graph-call-failed">
+  <parent>entramox-reconciler</parent>
+  <regex>^Graph call failed: method=([A-Z]+) url=(.+) status=([0-9]{3}) err=(.+)$</regex>
+  <order>http_method, url, status, err</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Reconcile lifecycle / run status
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-run-start">
+  <parent>entramox-reconciler</parent>
+  <regex>^---- Script start ----$</regex>
+  <order>msg</order>
+</decoder>
+
+<decoder name="entramox-reconciler-run-finish">
+  <parent>entramox-reconciler</parent>
+  <regex>^Sync complete\. Known=([0-9]+), Desired=([0-9]+), Disabled=([0-9]+), Tiered=([0-9]+)$</regex>
+  <order>known, desired, disabled_count, tiered_count</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     User lifecycle / account state
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-user-create">
+  <parent>entramox-reconciler</parent>
+  <regex>^Created local user: ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<decoder name="entramox-reconciler-user-delete">
+  <parent>entramox-reconciler</parent>
+  <regex>^Deleted user \(and home\): ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<decoder name="entramox-reconciler-user-lock">
+  <parent>entramox-reconciler</parent>
+  <regex>^Locked user: ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<decoder name="entramox-reconciler-user-unlock">
+  <parent>entramox-reconciler</parent>
+  <regex>^Unlocked user: ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<decoder name="entramox-reconciler-initpass">
+  <parent>entramox-reconciler</parent>
+  <regex>^Initial password set and expired for ([A-Za-z0-9_.-]+) \(not stored\)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Tiered accounts (v2.5)
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-tiered-create">
+  <parent>entramox-reconciler</parent>
+  <regex>^Created tiered account '([A-Za-z0-9_.-]+)' for base user '([A-Za-z0-9_.-]+)'$</regex>
+  <order>dstuser, srcuser</order>
+</decoder>
+
+<decoder name="entramox-reconciler-tiered-delete">
+  <parent>entramox-reconciler</parent>
+  <regex>^Tiered account removed \(no longer superadmin\): ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Group membership / allow-listing
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-group-add">
+  <parent>entramox-reconciler</parent>
+  <regex>^Added ([A-Za-z0-9_.-]+) to group ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser, group</order>
+</decoder>
+
+<decoder name="entramox-reconciler-group-remove">
+  <parent>entramox-reconciler</parent>
+  <regex>^Removed ([A-Za-z0-9_.-]+) from group ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser, group</order>
+</decoder>
+
+<decoder name="entramox-reconciler-not-in-allowgroups">
+  <parent>entramox-reconciler</parent>
+  <regex>^User ([A-Za-z0-9_.-]+) not in Entra allow-groups; locked and marked for deletion in (.+)$</regex>
+  <order>dstuser, ttl</order>
+</decoder>
+
+<decoder name="entramox-reconciler-deleted-after-grace">
+  <parent>entramox-reconciler</parent>
+  <regex>^User ([A-Za-z0-9_.-]+) disabled for >= .+; deleting$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Sudoers / privilege management
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-sudoers-update">
+  <parent>entramox-reconciler</parent>
+  <regex>^Updated sudoers for ([A-Za-z0-9_.-]+) at (.+)$</regex>
+  <order>dstuser, path</order>
+</decoder>
+
+<decoder name="entramox-reconciler-sudoers-remove">
+  <parent>entramox-reconciler</parent>
+  <regex>^Removed sudoers file for ([A-Za-z0-9_.-]+)$</regex>
+  <order>dstuser</order>
+</decoder>
+
+<decoder name="entramox-reconciler-visudo-fail">
+  <parent>entramox-reconciler</parent>
+  <regex>^visudo validation failed for ([A-Za-z0-9_.-]+): (.+)$</regex>
+  <order>dstuser, err</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Proxmox VE (PVE) user management
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-pve-user-created">
+  <parent>entramox-reconciler</parent>
+  <regex>^PVE user created: ([^ ]+) \(enable=([01])\)$</regex>
+  <order>userid, enabled</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pve-user-enabled">
+  <parent>entramox-reconciler</parent>
+  <regex>^PVE user ([^ ]+) set enable=([01])$</regex>
+  <order>userid, enabled</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pve-acl-set">
+  <parent>entramox-reconciler</parent>
+  <regex>^PVE ACL ensured: ([^ ]+) @ ([^ ]+) role=(.+)$</regex>
+  <order>userid, path, role</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Proxmox Backup Server (PBS) — v2.5
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-pbs-user-created">
+  <parent>entramox-reconciler</parent>
+  <regex>^PBS user created: ([^ ]+) \(enable=([01])\)$</regex>
+  <order>userid, enabled</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pbs-user-updated">
+  <parent>entramox-reconciler</parent>
+  <regex>^PBS user updated: ([^ ]+) \(enable=([01])\)$</regex>
+  <order>userid, enabled</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pbs-user-toggled">
+  <parent>entramox-reconciler</parent>
+  <regex>^PBS user ([^ ]+) set enable=([01])$</regex>
+  <order>userid, enabled</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pbs-acl-set">
+  <parent>entramox-reconciler</parent>
+  <regex>^PBS ACL set: ([^ ]+) role=([^ ]+) @ (.+)$</regex>
+  <order>userid, role, path</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pbs-error">
+  <parent>entramox-reconciler</parent>
+  <regex>^PBS (user create|user modify|ACL set|user enable-toggle) failed for? ?([^ ]+)(.*)$</regex>
+  <order>operation, userid, extra</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pbs-auth-missing">
+  <parent>entramox-reconciler</parent>
+  <regex>^PBS auth header missing; (.+)$</regex>
+  <order>extra</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Proxmox Datacenter Manager (PDM) — v2.5
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-pdm-user-created">
+  <parent>entramox-reconciler</parent>
+  <regex>^PDM user created: ([^ ]+) \(enable=([01])\)$</regex>
+  <order>userid, enabled</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pdm-user-updated">
+  <parent>entramox-reconciler</parent>
+  <regex>^PDM user updated: ([^ ]+) \(enable=([01])\)$</regex>
+  <order>userid, enabled</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pdm-user-toggled">
+  <parent>entramox-reconciler</parent>
+  <regex>^PDM user ([^ ]+) set enable=([01])$</regex>
+  <order>userid, enabled</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pdm-acl-set">
+  <parent>entramox-reconciler</parent>
+  <regex>^PDM ACL set: ([^ ]+) role=([^ ]+) @ (.+)$</regex>
+  <order>userid, role, path</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pdm-error">
+  <parent>entramox-reconciler</parent>
+  <regex>^PDM (user create|user modify|ACL set|user enable-toggle) failed for? ?([^ ]+)(.*)$</regex>
+  <order>operation, userid, extra</order>
+</decoder>
+
+<decoder name="entramox-reconciler-pdm-auth-missing">
+  <parent>entramox-reconciler</parent>
+  <regex>^PDM auth header missing; (.+)$</regex>
+  <order>extra</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Remote API errors (PBS + PDM shared) — v2.5
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-remote-api-http-error">
+  <parent>entramox-reconciler</parent>
+  <regex>^Remote API HTTP ([A-Z]+) ([^ ]+) ([0-9]{3}): (.+)$</regex>
+  <order>http_method, url, status, err</order>
+</decoder>
+
+<decoder name="entramox-reconciler-remote-api-error">
+  <parent>entramox-reconciler</parent>
+  <regex>^Remote API request failed ([A-Z]+) ([^ ]+): (.+)$</regex>
+  <order>http_method, url, err</order>
+</decoder>
+
+<!-- ------------------------------------------------
+     Operational / dependency checks
+     ------------------------------------------------ -->
+
+<decoder name="entramox-reconciler-missing-bin">
+  <parent>entramox-reconciler</parent>
+  <regex>^Missing required binary: ([A-Za-z0-9_.-]+) -> (.+)$</regex>
+  <order>bin_key, bin_path</order>
+</decoder>
+
+<decoder name="entramox-reconciler-exception">
+  <parent>entramox-reconciler</parent>
+  <regex>^Unhandled exception: (.+)$</regex>
+  <order>err</order>
+</decoder>
+
+<!-- ============================
+     ENTRAMOX INTEGRITY CHECKER DECODERS (v2.5)
+     Written by entramox_check.sh to thelog.log — same syslog stream
+     as the reconciler.  Messages contain the literal token [entramox_check]
+     so we can anchor child decoders without a separate program_name.
+
+     Log line format:
+       <date> <time> CRITICAL|WARNING  [entramox_check] Integrity: <key=value ...>
+     ============================ -->
+
+<!-- Parent: match any line containing [entramox_check] -->
+<decoder name="entramox-checker">
+  <parent>entramox-reconciler</parent>
+  <regex>\[entramox_check\] (.+)$</regex>
+  <order>msg</order>
+</decoder>
+
+<!-- Script checksum mismatch (critical — binary may be tampered) -->
+<decoder name="entramox-checker-script-tampered">
+  <parent>entramox-checker</parent>
+  <regex>^Integrity: script checksum mismatch file=([^ ]+) have=([0-9a-f]+) expect=([0-9a-f]+)$</regex>
+  <order>path, have_hash, expect_hash</order>
+</decoder>
+
+<!-- Symlink found where regular file expected -->
+<decoder name="entramox-checker-symlink-refused">
+  <parent>entramox-checker</parent>
+  <regex>^Integrity: symlink refused path=(.+)$</regex>
+  <order>path</order>
+</decoder>
+
+<!-- File not owned by root -->
+<decoder name="entramox-checker-not-owned-root">
+  <parent>entramox-checker</parent>
+  <regex>^Integrity: file not owned by root path=([^ ]+) uid=([0-9]+)$</regex>
+  <order>path, uid</order>
+</decoder>
+
+<!-- Permissions too broad -->
+<decoder name="entramox-checker-perms-too-broad">
+  <parent>entramox-checker</parent>
+  <regex>^Integrity: permissions too broad path=([^ ]+) mode=([^ ]+) want=([0-9]+)$</regex>
+  <order>path, mode, want</order>
+</decoder>
+
+<!-- Missing monitored file (warning, not necessarily tampering) -->
+<decoder name="entramox-checker-missing-file">
+  <parent>entramox-checker</parent>
+  <regex>^Integrity: missing file path=(.+)$</regex>
+  <order>path</order>
+</decoder>
+
+<!-- Env file checksum changed (warn — could be intentional reconfigure) -->
+<decoder name="entramox-checker-env-changed">
+  <parent>entramox-checker</parent>
+  <regex>^Integrity: env checksum changed path=([^ ]+) have=([0-9a-f]+) expect=([0-9a-f]+)$</regex>
+  <order>path, have_hash, expect_hash</order>
+</decoder>
+
+<!-- Key file checksum changed -->
+<decoder name="entramox-checker-key-changed">
+  <parent>entramox-checker</parent>
+  <regex>^Integrity: key checksum changed path=([^ ]+) have=([0-9a-f]+) expect=([0-9a-f]+)$</regex>
+  <order>path, have_hash, expect_hash</order>
+</decoder>
+
+<!-- ============================
+     ENTRAMOX AUDIT LOG DECODERS (v2.5)
+     JSON-lines from /var/log/entramoxreconciler/audit.log
+     Requires: log_format=json in ossec.conf localfile block
+     Fields extracted automatically by Wazuh JSON decoder.
+     Rules match on data.event field.
+     ============================ -->
+
+<decoder name="entramox-audit">
+  <program_name>^entramox-audit$</program_name>
+  <json_null_field>discard</json_null_field>
+  <use_own_name>true</use_own_name>
+</decoder>

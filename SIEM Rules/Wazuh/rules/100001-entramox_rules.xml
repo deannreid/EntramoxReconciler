@@ -1,0 +1,476 @@
+<!-- ================================================================
+  File    : 100001-entramox_rules.xml
+  Purpose : Entramox Reconciler detection rules for Wazuh
+  Notes   : Keyed off entramox decoders only — no free-text matching.
+  V2.5    : Added tiered accounts, PBS, PDM, remote API errors,
+            and JSON audit log rule group.
+================================================================ -->
+
+<!-- ================= RECONCILER (entramoxreconciler) ================= -->
+<group name="local,entramox,reconciler,">
+
+  <!-- ---------------- Auth / Graph / Token ---------------- -->
+
+  <rule id="2600" level="10">
+    <decoded_as>entramox-reconciler-graph-creds-missing</decoded_as>
+    <description>Entramox: Graph credentials missing (tenant/client/secret not set)</description>
+    <mitre><id>T1552</id></mitre>
+    <group>entramox,auth,misconfig,</group>
+  </rule>
+
+  <rule id="2601" level="9">
+    <decoded_as>entramox-reconciler-token-request-failed</decoded_as>
+    <description>Entramox: Token request failed (HTTP $(status))</description>
+    <group>entramox,auth,graph,error,</group>
+  </rule>
+
+  <rule id="2602" level="8">
+    <decoded_as>entramox-reconciler-token-response-missing</decoded_as>
+    <description>Entramox: Token response missing access_token</description>
+    <group>entramox,auth,graph,error,</group>
+  </rule>
+
+  <rule id="2603" level="9">
+    <decoded_as>entramox-reconciler-graph-call-failed</decoded_as>
+    <description>Entramox: Graph call failed ($(http_method)) (HTTP $(status))</description>
+    <group>entramox,graph,error,</group>
+  </rule>
+
+  <!-- ---------------- Run lifecycle / observability ---------------- -->
+
+  <rule id="2610" level="3">
+    <decoded_as>entramox-reconciler-run-start</decoded_as>
+    <description>Entramox: Reconcile started</description>
+    <group>entramox,run,</group>
+  </rule>
+
+  <rule id="2611" level="3">
+    <decoded_as>entramox-reconciler-run-finish</decoded_as>
+    <description>Entramox: Reconcile finished — known=$(known) desired=$(desired) disabled=$(disabled_count) tiered=$(tiered_count)</description>
+    <group>entramox,run,</group>
+  </rule>
+
+</group>
+
+<!-- ================= ACCOUNT MANAGEMENT ================= -->
+<group name="local,entramox,account_management,">
+
+  <!-- User lifecycle -->
+  <rule id="2700" level="7">
+    <decoded_as>entramox-reconciler-user-create</decoded_as>
+    <description>Entramox: Local user created ($(dstuser))</description>
+    <group>user,provisioning,entramox,</group>
+  </rule>
+
+  <rule id="2701" level="10">
+    <decoded_as>entramox-reconciler-user-delete</decoded_as>
+    <description>Entramox: Local user deleted (and home) ($(dstuser))</description>
+    <group>user,deprovisioning,entramox,</group>
+  </rule>
+
+  <!-- Account lock/unlock -->
+  <rule id="2710" level="6">
+    <decoded_as>entramox-reconciler-user-lock</decoded_as>
+    <description>Entramox: Account locked ($(dstuser))</description>
+    <group>user,lock,entramox,</group>
+  </rule>
+
+  <rule id="2711" level="6">
+    <decoded_as>entramox-reconciler-user-unlock</decoded_as>
+    <description>Entramox: Account unlocked ($(dstuser))</description>
+    <group>user,unlock,entramox,</group>
+  </rule>
+
+  <rule id="2712" level="6">
+    <decoded_as>entramox-reconciler-initpass</decoded_as>
+    <description>Entramox: Initial password set and expired ($(dstuser))</description>
+    <group>user,password,entramox,</group>
+  </rule>
+
+  <!-- Group membership changes -->
+  <rule id="2720" level="6">
+    <decoded_as>entramox-reconciler-group-add</decoded_as>
+    <description>Entramox: Group membership added ($(dstuser) -> $(group))</description>
+    <group>group_membership,entramox,</group>
+  </rule>
+
+  <rule id="2721" level="6">
+    <decoded_as>entramox-reconciler-group-remove</decoded_as>
+    <description>Entramox: Group membership removed ($(dstuser) -> $(group))</description>
+    <group>group_membership,entramox,</group>
+  </rule>
+
+  <!-- Privilege changes (sudo group specifically) -->
+  <rule id="2725" level="9">
+    <decoded_as>entramox-reconciler-group-add</decoded_as>
+    <match> to group sudo</match>
+    <description>Entramox: Privilege grant — user added to sudo group ($(dstuser))</description>
+    <mitre><id>T1548</id></mitre>
+    <group>privilege_escalation,sudo,entramox,</group>
+  </rule>
+
+  <rule id="2726" level="8">
+    <decoded_as>entramox-reconciler-group-remove</decoded_as>
+    <match> from group sudo</match>
+    <description>Entramox: Privilege revoked — user removed from sudo group ($(dstuser))</description>
+    <group>privilege_revocation,sudo,entramox,</group>
+  </rule>
+
+  <!-- Sudoers managed file changes -->
+  <rule id="2730" level="9">
+    <decoded_as>entramox-reconciler-sudoers-update</decoded_as>
+    <description>Entramox: Sudoers file updated ($(dstuser) @ $(path))</description>
+    <mitre><id>T1548.003</id></mitre>
+    <group>sudoers_change,entramox,</group>
+  </rule>
+
+  <rule id="2731" level="8">
+    <decoded_as>entramox-reconciler-sudoers-remove</decoded_as>
+    <description>Entramox: Sudoers file removed ($(dstuser))</description>
+    <group>sudoers_change,entramox,</group>
+  </rule>
+
+  <rule id="2732" level="9">
+    <decoded_as>entramox-reconciler-visudo-fail</decoded_as>
+    <description>Entramox: visudo validation failed for $(dstuser)</description>
+    <group>sudoers_change,error,entramox,</group>
+  </rule>
+
+  <!-- Deprovision lifecycle -->
+  <rule id="2740" level="6">
+    <decoded_as>entramox-reconciler-not-in-allowgroups</decoded_as>
+    <description>Entramox: User not in allow-groups; locked and marked for deletion ($(dstuser)) — TTL $(ttl)</description>
+    <group>deprovisioning,entramox,</group>
+  </rule>
+
+  <rule id="2741" level="10">
+    <decoded_as>entramox-reconciler-deleted-after-grace</decoded_as>
+    <description>Entramox: User deleted after grace period ($(dstuser))</description>
+    <group>deprovisioning,entramox,</group>
+  </rule>
+
+  <!-- Operational issues -->
+  <rule id="2760" level="8">
+    <decoded_as>entramox-reconciler-missing-bin</decoded_as>
+    <description>Entramox: Missing required binary ($(bin_key) -> $(bin_path))</description>
+    <group>operational,entramox,</group>
+  </rule>
+
+  <rule id="2765" level="12">
+    <decoded_as>entramox-reconciler-exception</decoded_as>
+    <description>Entramox: Unhandled exception — $(err)</description>
+    <group>error,exception,entramox,</group>
+  </rule>
+
+</group>
+
+<!-- ================= TIERED ACCOUNTS (v2.5) ================= -->
+<group name="local,entramox,tiered_accounts,">
+
+  <rule id="2770" level="7">
+    <decoded_as>entramox-reconciler-tiered-create</decoded_as>
+    <description>Entramox: Tiered (privileged) account created — $(dstuser) for base user $(srcuser)</description>
+    <mitre><id>T1548</id></mitre>
+    <group>user,provisioning,privilege_escalation,entramox,</group>
+  </rule>
+
+  <rule id="2771" level="9">
+    <decoded_as>entramox-reconciler-tiered-delete</decoded_as>
+    <description>Entramox: Tiered account removed — user no longer superadmin ($(dstuser))</description>
+    <group>user,deprovisioning,entramox,</group>
+  </rule>
+
+  <!-- High-signal: tiered account created for superadmin -->
+  <rule id="2772" level="10">
+    <if_sid>2770</if_sid>
+    <description>Entramox: Privileged tier account provisioned — $(dstuser) granted superadmin Linux access via tiered model</description>
+    <mitre><id>T1548</id><id>T1136.001</id></mitre>
+    <group>user,provisioning,privilege_escalation,entramox,high_confidence,</group>
+  </rule>
+
+</group>
+
+<!-- ================= PROXMOX VE (PVE) ================= -->
+<group name="local,entramox,proxmox_ve,">
+
+  <rule id="2780" level="6">
+    <decoded_as>entramox-reconciler-pve-user-created</decoded_as>
+    <description>Entramox: PVE user created — $(userid) (enable=$(enabled))</description>
+    <group>pve,user,provisioning,entramox,</group>
+  </rule>
+
+  <rule id="2781" level="7">
+    <decoded_as>entramox-reconciler-pve-user-enabled</decoded_as>
+    <field name="enabled">^1$</field>
+    <description>Entramox: PVE user enabled — $(userid)</description>
+    <group>pve,user,entramox,</group>
+  </rule>
+
+  <rule id="2782" level="6">
+    <decoded_as>entramox-reconciler-pve-user-enabled</decoded_as>
+    <field name="enabled">^0$</field>
+    <description>Entramox: PVE user disabled — $(userid)</description>
+    <group>pve,user,entramox,</group>
+  </rule>
+
+  <rule id="2783" level="5">
+    <decoded_as>entramox-reconciler-pve-acl-set</decoded_as>
+    <description>Entramox: PVE ACL assigned — $(userid) role=$(role) @ $(path)</description>
+    <group>pve,acl,entramox,</group>
+  </rule>
+
+</group>
+
+<!-- ================= PROXMOX BACKUP SERVER (PBS) (v2.5) ================= -->
+<group name="local,entramox,proxmox_backup,">
+
+  <rule id="2790" level="6">
+    <decoded_as>entramox-reconciler-pbs-user-created</decoded_as>
+    <description>Entramox: PBS user created — $(userid) (enable=$(enabled))</description>
+    <group>pbs,user,provisioning,entramox,</group>
+  </rule>
+
+  <rule id="2791" level="7">
+    <decoded_as>entramox-reconciler-pbs-user-toggled</decoded_as>
+    <field name="enabled">^1$</field>
+    <description>Entramox: PBS user enabled — $(userid)</description>
+    <group>pbs,user,entramox,</group>
+  </rule>
+
+  <rule id="2792" level="6">
+    <decoded_as>entramox-reconciler-pbs-user-toggled</decoded_as>
+    <field name="enabled">^0$</field>
+    <description>Entramox: PBS user disabled — $(userid)</description>
+    <group>pbs,user,entramox,</group>
+  </rule>
+
+  <rule id="2793" level="5">
+    <decoded_as>entramox-reconciler-pbs-acl-set</decoded_as>
+    <description>Entramox: PBS ACL assigned — $(userid) role=$(role) @ $(path)</description>
+    <group>pbs,acl,entramox,</group>
+  </rule>
+
+  <rule id="2794" level="10">
+    <decoded_as>entramox-reconciler-pbs-error</decoded_as>
+    <description>Entramox: PBS operation failed — $(operation) for $(userid)</description>
+    <group>pbs,error,entramox,</group>
+  </rule>
+
+  <rule id="2795" level="12">
+    <decoded_as>entramox-reconciler-pbs-auth-missing</decoded_as>
+    <description>Entramox: PBS authentication credentials missing or invalid — PBS sync will not run</description>
+    <mitre><id>T1552</id></mitre>
+    <group>pbs,auth,misconfig,entramox,</group>
+  </rule>
+
+</group>
+
+<!-- ================= PROXMOX DATACENTER MANAGER (PDM) (v2.5) ================= -->
+<group name="local,entramox,proxmox_datacenter,">
+
+  <rule id="2800" level="6">
+    <decoded_as>entramox-reconciler-pdm-user-created</decoded_as>
+    <description>Entramox: PDM user created — $(userid) (enable=$(enabled))</description>
+    <group>pdm,user,provisioning,entramox,</group>
+  </rule>
+
+  <rule id="2801" level="7">
+    <decoded_as>entramox-reconciler-pdm-user-toggled</decoded_as>
+    <field name="enabled">^1$</field>
+    <description>Entramox: PDM user enabled — $(userid)</description>
+    <group>pdm,user,entramox,</group>
+  </rule>
+
+  <rule id="2802" level="6">
+    <decoded_as>entramox-reconciler-pdm-user-toggled</decoded_as>
+    <field name="enabled">^0$</field>
+    <description>Entramox: PDM user disabled — $(userid)</description>
+    <group>pdm,user,entramox,</group>
+  </rule>
+
+  <rule id="2803" level="5">
+    <decoded_as>entramox-reconciler-pdm-acl-set</decoded_as>
+    <description>Entramox: PDM ACL assigned — $(userid) role=$(role) @ $(path)</description>
+    <group>pdm,acl,entramox,</group>
+  </rule>
+
+  <rule id="2804" level="10">
+    <decoded_as>entramox-reconciler-pdm-error</decoded_as>
+    <description>Entramox: PDM operation failed — $(operation) for $(userid)</description>
+    <group>pdm,error,entramox,</group>
+  </rule>
+
+  <rule id="2805" level="12">
+    <decoded_as>entramox-reconciler-pdm-auth-missing</decoded_as>
+    <description>Entramox: PDM authentication credentials missing or invalid — PDM sync will not run</description>
+    <mitre><id>T1552</id></mitre>
+    <group>pdm,auth,misconfig,entramox,</group>
+  </rule>
+
+</group>
+
+<!-- ================= REMOTE API ERRORS (PBS + PDM shared) (v2.5) ================= -->
+<group name="local,entramox,remote_api,">
+
+  <rule id="2810" level="9">
+    <decoded_as>entramox-reconciler-remote-api-http-error</decoded_as>
+    <description>Entramox: Remote API HTTP error — $(http_method) $(url) status=$(status)</description>
+    <group>remote_api,http,error,entramox,</group>
+  </rule>
+
+  <!-- 401/403 specifically — credential or permission problem -->
+  <rule id="2811" level="12">
+    <if_sid>2810</if_sid>
+    <field name="status">^40[13]$</field>
+    <description>Entramox: Remote API authentication/authorisation failure — $(http_method) $(url) status=$(status)</description>
+    <mitre><id>T1552</id></mitre>
+    <group>remote_api,auth,error,entramox,</group>
+  </rule>
+
+  <rule id="2812" level="8">
+    <decoded_as>entramox-reconciler-remote-api-error</decoded_as>
+    <description>Entramox: Remote API connection failed — $(http_method) $(url): $(err)</description>
+    <group>remote_api,connectivity,error,entramox,</group>
+  </rule>
+
+</group>
+
+<!-- ================= JSON AUDIT LOG (v2.5) ================= -->
+<!-- These rules match events from /var/log/entramoxreconciler/audit.log
+     which is read as log_format=json. Wazuh extracts JSON fields into
+     data.* automatically; rules filter on data.event.              -->
+<group name="local,entramox,audit_log,">
+
+  <rule id="2820" level="7">
+    <decoded_as>entramox-audit</decoded_as>
+    <field name="data.event">^USER_CREATED$</field>
+    <description>Entramox Audit: Linux user created — $(data.user)</description>
+    <group>audit,user,provisioning,entramox,</group>
+  </rule>
+
+  <rule id="2821" level="9">
+    <decoded_as>entramox-audit</decoded_as>
+    <field name="data.event">^SUDO_GRANTED$</field>
+    <description>Entramox Audit: Sudo granted — $(data.user)</description>
+    <mitre><id>T1548</id></mitre>
+    <group>audit,sudo,privilege_escalation,entramox,</group>
+  </rule>
+
+  <rule id="2822" level="9">
+    <decoded_as>entramox-audit</decoded_as>
+    <field name="data.event">^TIERED_ACCOUNT_CREATED$</field>
+    <description>Entramox Audit: Tiered account created — $(data.tiered_user) for base $(data.base_user)</description>
+    <mitre><id>T1548</id><id>T1136.001</id></mitre>
+    <group>audit,tiered,privilege_escalation,entramox,</group>
+  </rule>
+
+  <rule id="2823" level="8">
+    <decoded_as>entramox-audit</decoded_as>
+    <field name="data.event">^TIERED_ACCOUNT_DELETED$</field>
+    <description>Entramox Audit: Tiered account removed — $(data.tiered_user)</description>
+    <group>audit,tiered,deprovisioning,entramox,</group>
+  </rule>
+
+  <!-- ================================================================
+       INTEGRITY CHECKER — entramox_check.sh events (v2.5)
+       Level mapping (sev 2 / high-critical):
+         14 = script binary tampered (hash mismatch)  → CRITICAL
+         13 = symlink / wrong owner / bad perms        → CRITICAL
+         10 = env or key file checksum changed         → WARNING (possible re-config)
+          8 = monitored file missing                   → WARNING
+       ================================================================ -->
+
+  <!-- Script binary checksum mismatch — highest severity -->
+  <rule id="2830" level="14">
+    <decoded_as>entramox-checker-script-tampered</decoded_as>
+    <description>Entramox Integrity: script checksum mismatch — possible binary tampering ($(path))</description>
+    <mitre><id>T1195</id><id>T1574</id></mitre>
+    <group>entramox,integrity,tampering,</group>
+  </rule>
+
+  <!-- Symlink where file expected — redirection / hijack attempt -->
+  <rule id="2831" level="13">
+    <decoded_as>entramox-checker-symlink-refused</decoded_as>
+    <description>Entramox Integrity: symlink detected for monitored path — possible hijack ($(path))</description>
+    <mitre><id>T1574.010</id></mitre>
+    <group>entramox,integrity,tampering,</group>
+  </rule>
+
+  <!-- File not owned by root -->
+  <rule id="2832" level="13">
+    <decoded_as>entramox-checker-not-owned-root</decoded_as>
+    <description>Entramox Integrity: monitored file not owned by root — uid=$(uid) path=$(path)</description>
+    <mitre><id>T1222</id></mitre>
+    <group>entramox,integrity,tampering,</group>
+  </rule>
+
+  <!-- Permissions too permissive -->
+  <rule id="2833" level="13">
+    <decoded_as>entramox-checker-perms-too-broad</decoded_as>
+    <description>Entramox Integrity: permissions too broad on monitored file — mode=$(mode) path=$(path)</description>
+    <mitre><id>T1222</id></mitre>
+    <group>entramox,integrity,tampering,</group>
+  </rule>
+
+  <!-- Env file checksum changed — potential credential swap -->
+  <rule id="2834" level="10">
+    <decoded_as>entramox-checker-env-changed</decoded_as>
+    <description>Entramox Integrity: env file checksum changed — verify intentional ($(path))</description>
+    <mitre><id>T1552.001</id></mitre>
+    <group>entramox,integrity,config_change,</group>
+  </rule>
+
+  <!-- Key file checksum changed -->
+  <rule id="2835" level="10">
+    <decoded_as>entramox-checker-key-changed</decoded_as>
+    <description>Entramox Integrity: key file checksum changed — possible credential rotation or tamper ($(path))</description>
+    <mitre><id>T1552.001</id></mitre>
+    <group>entramox,integrity,config_change,</group>
+  </rule>
+
+  <!-- Missing monitored file -->
+  <rule id="2836" level="8">
+    <decoded_as>entramox-checker-missing-file</decoded_as>
+    <description>Entramox Integrity: monitored file missing — $(path)</description>
+    <group>entramox,integrity,misconfig,</group>
+  </rule>
+
+  <!-- Composite: multiple integrity failures in same run (escalation) -->
+  <rule id="2837" level="14" frequency="2" timeframe="60">
+    <if_matched_sid>2831,2832,2833</if_matched_sid>
+    <description>Entramox Integrity: multiple file tampering indicators detected in 60s — possible active attack</description>
+    <mitre><id>T1574</id></mitre>
+    <group>entramox,integrity,tampering,</group>
+  </rule>
+
+  <!-- ================================================================ -->
+
+  <rule id="2824" level="6">
+    <decoded_as>entramox-audit</decoded_as>
+    <field name="data.event">^PBS_USER_CREATED$</field>
+    <description>Entramox Audit: PBS user provisioned — $(data.userid)</description>
+    <group>audit,pbs,provisioning,entramox,</group>
+  </rule>
+
+  <rule id="2825" level="7">
+    <decoded_as>entramox-audit</decoded_as>
+    <field name="data.event">^PBS_USER_TOGGLED$</field>
+    <description>Entramox Audit: PBS user state changed — $(data.userid) enabled=$(data.enabled)</description>
+    <group>audit,pbs,entramox,</group>
+  </rule>
+
+  <rule id="2826" level="6">
+    <decoded_as>entramox-audit</decoded_as>
+    <field name="data.event">^PDM_USER_CREATED$</field>
+    <description>Entramox Audit: PDM user provisioned — $(data.userid)</description>
+    <group>audit,pdm,provisioning,entramox,</group>
+  </rule>
+
+  <rule id="2827" level="7">
+    <decoded_as>entramox-audit</decoded_as>
+    <field name="data.event">^PDM_USER_TOGGLED$</field>
+    <description>Entramox Audit: PDM user state changed — $(data.userid) enabled=$(data.enabled)</description>
+    <group>audit,pdm,entramox,</group>
+  </rule>
+
+</group>

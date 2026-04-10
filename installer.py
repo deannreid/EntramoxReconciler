@@ -802,18 +802,31 @@ set -euo pipefail
 SCRIPT="{SCRIPT_DST}"
 ENVFILE="{ENVFILE}"
 KEYFILE="{KEYFILE}"
+LOGFILE="{LOGDIR}/thelog.log"
 
 EXPECTED_SHA="{expected_sha}"
 EXPECTED_ENV_SHA="{expected_env_sha}"
 EXPECTED_KEY_SHA="{expected_key_sha}"
 
+# Write a timestamped line to the shared application log file so that the
+# reconciler's own log (and any SIEM monitoring it) captures integrity events.
+log_to_file() {{
+    local level="$1"
+    local msg="$2"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "$ts $level [entramox_check] $msg" >> "$LOGFILE" 2>/dev/null || true
+}}
+
 log_warn() {{
-    logger -t entramox_runner "$1" || true
+    log_to_file "WARNING " "$1"
+    logger -t entramox_check "$1" || true
     echo "$1" >&2
 }}
 
 fail() {{
-    logger -t entramox_runner "$1" || true
+    log_to_file "CRITICAL" "$1"
+    logger -t entramox_check "$1" || true
     echo "$1" >&2
     exit 1
 }}
@@ -821,22 +834,22 @@ fail() {{
 check_secure_file() {{
     local p="$1"
     if [[ ! -e "$p" ]]; then
-        log_warn "Integrity: missing file: $p"
+        log_warn "Integrity: missing file path=$p"
         return 0
     fi
     if [[ -L "$p" ]]; then
-        fail "Integrity: refusing to use symlink: $p"
+        fail "Integrity: symlink refused path=$p"
     fi
     local uid
     uid=$(stat -Lc %u "$p" 2>/dev/null || echo 99999)
     if [[ "$uid" != "0" ]]; then
-        fail "Integrity: $p not owned by root (uid=$uid)"
+        fail "Integrity: file not owned by root path=$p uid=$uid"
     fi
     local mode
     mode=$(stat -Lc %a "$p" 2>/dev/null || echo 777)
     mode=${{mode: -3}}
     if (( 10#"$mode" > 600 )); then
-        fail "Integrity: $p permissions too broad (have $mode, want <= 600)"
+        fail "Integrity: permissions too broad path=$p mode=$mode want=600"
     fi
 }}
 
@@ -846,14 +859,14 @@ sha256_file() {{
 
 ACTUAL_SHA=$(sha256_file "$SCRIPT")
 if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
-    fail "Checksum mismatch! Potential tampering detected in $SCRIPT (have=$ACTUAL_SHA expect=$EXPECTED_SHA)"
+    fail "Integrity: script checksum mismatch file=$SCRIPT have=$ACTUAL_SHA expect=$EXPECTED_SHA"
 fi
 
 check_secure_file "$ENVFILE"
 if [[ -e "$ENVFILE" && -n "$EXPECTED_ENV_SHA" ]]; then
     ACTUAL_ENV_SHA=$(sha256_file "$ENVFILE")
     if [[ "$ACTUAL_ENV_SHA" != "$EXPECTED_ENV_SHA" ]]; then
-        log_warn "Integrity: env checksum changed: $ENVFILE (have=$ACTUAL_ENV_SHA expect=$EXPECTED_ENV_SHA)"
+        log_warn "Integrity: env checksum changed path=$ENVFILE have=$ACTUAL_ENV_SHA expect=$EXPECTED_ENV_SHA"
     fi
 fi
 
@@ -861,7 +874,7 @@ check_secure_file "$KEYFILE"
 if [[ -e "$KEYFILE" && -n "$EXPECTED_KEY_SHA" ]]; then
     ACTUAL_KEY_SHA=$(sha256_file "$KEYFILE")
     if [[ "$ACTUAL_KEY_SHA" != "$EXPECTED_KEY_SHA" ]]; then
-        log_warn "Integrity: key checksum changed: $KEYFILE (have=$ACTUAL_KEY_SHA expect=$EXPECTED_KEY_SHA)"
+        log_warn "Integrity: key checksum changed path=$KEYFILE have=$ACTUAL_KEY_SHA expect=$EXPECTED_KEY_SHA"
     fi
 fi
 
