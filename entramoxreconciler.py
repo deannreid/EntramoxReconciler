@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import secrets
+import ssl
 import stat
 import string
 import subprocess
@@ -95,6 +96,50 @@ BIN = {
   "groupadd": "/usr/sbin/groupadd",
   "gpasswd":  "/usr/bin/gpasswd",
 }
+
+#-----------------------------------------#
+# Tiered Accounts (privilege separation)  #
+#-----------------------------------------#
+# When enabled, superadmin users get a second account with a prefix/suffix
+# (e.g. "a-john") that holds sudo and elevated access. The base account
+# is left without privileges, enforcing least-privilege separation.
+TIERED_ACCOUNTS      = False       # Create a privileged twin account for superadmins
+TIERED_ACCOUNT_MODE  = "prefix"    # "prefix" or "suffix"
+TIERED_ACCOUNT_VALUE = ""          # e.g. "a-" (prefix) or "-adm" (suffix)
+TIERED_ACCOUNT_SCOPE = "linux"     # "linux" (Linux only) or "both" (Linux + Proxmox/PBS/PDM)
+
+#--------------------------------------------#
+# Proxmox Backup Server (PBS) integration    #
+#--------------------------------------------#
+PBS_ENABLED          = False
+PBS_HOST             = ""
+PBS_PORT             = 8007
+PBS_REALM            = ""          # PBS realm for synced users (leave blank to use REALM)
+PBS_API_USER         = ""          # e.g. "root@pam"
+PBS_TOKEN_NAME       = ""          # API token name
+PBS_TOKEN_VALUE_ENC  = ""          # Fernet-encrypted token value (or plaintext)
+PBS_DEFAULT_ROLE     = "DatastoreReader"  # Default PBS role for all users
+PBS_ADMIN_ROLE       = "DatastoreAdmin"   # PBS role for superadmins
+PBS_VERIFY_TLS       = True        # Set False for self-signed certs
+
+#--------------------------------------------------#
+# Proxmox Datacenter Manager (PDM) integration     #
+#--------------------------------------------------#
+PDM_ENABLED          = False
+PDM_HOST             = ""
+PDM_PORT             = 8443
+PDM_REALM            = ""          # PDM realm (leave blank to use REALM)
+PDM_API_USER         = ""
+PDM_TOKEN_NAME       = ""
+PDM_TOKEN_VALUE_ENC  = ""
+PDM_DEFAULT_ROLE     = "DCOperator"
+PDM_ADMIN_ROLE       = "DCAdmin"
+PDM_VERIFY_TLS       = True
+
+#---------------------------#
+# Security audit log        #
+#---------------------------#
+AUDIT_LOG = "/var/log/entramoxreconciler/audit.log"
 
 #---------------------------------------------#
 # Microsoft Graph (client-credentials via env)#
@@ -296,6 +341,40 @@ def _pickSourceGroupName(upn: str, groups: list[dict]) -> str | None:
 
     return None
 
+def _pickAllSourceGroupNames(upn: str, groups: list[dict]) -> list[str]:
+    """Return ALL Graph group displayNames that contain this UPN (case-insensitive)."""
+    upn_l = (upn or "").strip().lower()
+    if not upn_l:
+        return []
+    names: list[str] = []
+    for g in groups or []:
+        members = g.get("members") or []
+        if not isinstance(members, list):
+            continue
+        for row in members:
+            if not isinstance(row, (list, tuple)) or not row:
+                continue
+            member_upn = (row[0] or "").strip().lower()
+            if member_upn == upn_l:
+                name = g.get("name") or g.get("id") or None
+                if name and name not in names:
+                    names.append(name)
+                break
+    return names
+
+def fncMakeTieredUsername(base_unix: str) -> str:
+    """
+    Apply the configured prefix or suffix to a base unix username for tiered accounts.
+    Returns the base username unchanged if tiered accounts are disabled or value is empty.
+    """
+    if not TIERED_ACCOUNTS or not TIERED_ACCOUNT_VALUE:
+        return base_unix
+    if TIERED_ACCOUNT_MODE == "suffix":
+        raw = f"{base_unix}{TIERED_ACCOUNT_VALUE}"
+    else:
+        raw = f"{TIERED_ACCOUNT_VALUE}{base_unix}"
+    return fncSanitiseUnix(raw)
+
 def _lookupUserMeta(upn: str, groups: list[dict]) -> dict:
     """
     Merge metadata for a user across groups; prefer non-empty fields.
@@ -359,17 +438,26 @@ def _graphFailOrWarn(message: str):
 def _buildPveMetaForUpn(upn: str, groups: list[dict]) -> tuple[dict, str]:
     """
     Return (meta_dict, comment_str) for a UPN using Graph group data.
+    The comment lists ALL groups the user was sourced from so the description
+    clearly shows which groups granted the account.
     """
-    src_label = None
-    meta = {}
+    src_labels: list[str] = []
+    meta: dict = {}
 
     try:
-        src_label = _pickSourceGroupName(upn, groups) if groups else None
+        src_labels = _pickAllSourceGroupNames(upn, groups) if groups else []
         meta = _lookupUserMeta(upn, groups) if groups else {}
     except Exception as e:
         logging.debug("Metadata lookup failed for %s: %s", upn, e)
 
-    comment = f"Synced from Entra via {src_label} Group" if src_label else "Synced from Entra"
+    if src_labels:
+        if len(src_labels) == 1:
+            comment = f"Synced from Entra via '{src_labels[0]}' Group"
+        else:
+            groups_str = ", ".join(f"'{n}'" for n in src_labels)
+            comment = f"Synced from Entra via Groups: {groups_str}"
+    else:
+        comment = "Synced from Entra"
     return meta, comment
 
 def _format_remaining(td: timedelta) -> str:
@@ -382,7 +470,8 @@ def _format_remaining(td: timedelta) -> str:
     minutes, _ = divmod(rem, 60)
     return f"{hours}h {minutes}m"
 
-def _setPveDeletionComment(user: str, locked_at: datetime, unix_to_upn: dict[str, str], src_label: str | None):
+def _setPveDeletionComment(user: str, locked_at: datetime, unix_to_upn: dict[str, str],
+                           src_labels: list[str] | None = None):
     upn = unix_to_upn.get(user) or fncResolveUpnForUnix(user)
     if not upn:
         logging.debug("Cannot set deletion comment; no UPN for %s", user)
@@ -392,7 +481,13 @@ def _setPveDeletionComment(user: str, locked_at: datetime, unix_to_upn: dict[str
     remaining = DELETE_AFTER - (now - locked_at)
     remaining_str = _format_remaining(remaining)
 
-    group_part = f"{src_label} Group" if src_label else "Entra allow-groups"
+    if src_labels:
+        if len(src_labels) == 1:
+            group_part = f"'{src_labels[0]}' Group"
+        else:
+            group_part = "Groups: " + ", ".join(f"'{n}'" for n in src_labels)
+    else:
+        group_part = "Entra allow-groups"
 
     comment = (
         f"User no longer in {group_part} – "
@@ -448,6 +543,36 @@ for gid in (ENTRA_ALLUSERS_GROUP_ID, ENTRA_SUPERADMIN_GROUP_ID):
         _graph_ids.add(gid)
 
 GRAPH_GROUP_IDS = sorted(_graph_ids)
+
+# Tiered accounts
+TIERED_ACCOUNTS      = _env_bool("TIERED_ACCOUNTS",      TIERED_ACCOUNTS)
+TIERED_ACCOUNT_MODE  = _env_str ("TIERED_ACCOUNT_MODE",  TIERED_ACCOUNT_MODE)
+TIERED_ACCOUNT_VALUE = _env_str ("TIERED_ACCOUNT_VALUE", TIERED_ACCOUNT_VALUE)
+TIERED_ACCOUNT_SCOPE = _env_str ("TIERED_ACCOUNT_SCOPE", TIERED_ACCOUNT_SCOPE)
+
+# PBS
+PBS_ENABLED         = _env_bool("PBS_ENABLED",         PBS_ENABLED)
+PBS_HOST            = _env_str ("PBS_HOST",            PBS_HOST)
+PBS_PORT            = int(os.getenv("PBS_PORT",        str(PBS_PORT)) or PBS_PORT)
+PBS_REALM           = _env_str ("PBS_REALM",           PBS_REALM)
+PBS_API_USER        = _env_str ("PBS_API_USER",        PBS_API_USER)
+PBS_TOKEN_NAME      = _env_str ("PBS_TOKEN_NAME",      PBS_TOKEN_NAME)
+PBS_TOKEN_VALUE_ENC = _env_str ("PBS_TOKEN_VALUE_ENC", PBS_TOKEN_VALUE_ENC)
+PBS_DEFAULT_ROLE    = _env_str ("PBS_DEFAULT_ROLE",    PBS_DEFAULT_ROLE)
+PBS_ADMIN_ROLE      = _env_str ("PBS_ADMIN_ROLE",      PBS_ADMIN_ROLE)
+PBS_VERIFY_TLS      = _env_bool("PBS_VERIFY_TLS",      PBS_VERIFY_TLS)
+
+# PDM
+PDM_ENABLED         = _env_bool("PDM_ENABLED",         PDM_ENABLED)
+PDM_HOST            = _env_str ("PDM_HOST",            PDM_HOST)
+PDM_PORT            = int(os.getenv("PDM_PORT",        str(PDM_PORT)) or PDM_PORT)
+PDM_REALM           = _env_str ("PDM_REALM",           PDM_REALM)
+PDM_API_USER        = _env_str ("PDM_API_USER",        PDM_API_USER)
+PDM_TOKEN_NAME      = _env_str ("PDM_TOKEN_NAME",      PDM_TOKEN_NAME)
+PDM_TOKEN_VALUE_ENC = _env_str ("PDM_TOKEN_VALUE_ENC", PDM_TOKEN_VALUE_ENC)
+PDM_DEFAULT_ROLE    = _env_str ("PDM_DEFAULT_ROLE",    PDM_DEFAULT_ROLE)
+PDM_ADMIN_ROLE      = _env_str ("PDM_ADMIN_ROLE",      PDM_ADMIN_ROLE)
+PDM_VERIFY_TLS      = _env_bool("PDM_VERIFY_TLS",      PDM_VERIFY_TLS)
 
 # Map group → PVE role (only non-empty)
 PVE_ROLE_BY_GROUP = {
@@ -533,6 +658,22 @@ def fncSetupLogging():
     )
     logging.info("---- Script start ----")
     fncEnsureLogrotate()
+
+# Function: fncAuditEvent
+# Purpose : Write a structured security audit event to the audit log (JSON-lines format).
+# Notes   : One JSON object per line; suitable for SIEM ingestion.
+def fncAuditEvent(event: str, details: dict | None = None):
+    record = {
+        "ts":    datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "event": event,
+    }
+    if details:
+        record.update(details)
+    try:
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps(record, separators=(',', ':')) + "\n")
+    except Exception as e:
+        logging.warning("Could not write audit event %s: %s", event, e)
 
 # Function: fncPrintMessage
 # Purpose : Human-friendly colored console messages.
@@ -770,6 +911,33 @@ def fncCreateUser(user: str) -> bool:
     logging.info("Created local user: %s", user)
     return True
 
+# Function: fncGetLinuxGecos
+# Purpose : Read the GECOS (comment) field from /etc/passwd for a user.
+# Notes   : Uses getent to avoid importing the pwd module.
+def fncGetLinuxGecos(user: str) -> str:
+    rc, out, _ = fncRun("getent", ["passwd", user])
+    if rc != 0 or not out:
+        return ""
+    parts = out.split(":", 6)
+    return parts[4] if len(parts) >= 5 else ""
+
+# Function: fncSetLinuxGecos
+# Purpose : Update the GECOS (comment) field of a Linux user showing their source group(s).
+# Notes   : Idempotent (reads current value first); colons are replaced with semicolons.
+def fncSetLinuxGecos(user: str, comment: str) -> bool:
+    safe_comment = (comment or "").replace(":", ";").replace("\n", " ").strip()
+    if not safe_comment:
+        return False
+    current = fncGetLinuxGecos(user)
+    if current == safe_comment:
+        return False
+    rc, _, err = fncRun("usermod", ["-c", safe_comment, user])
+    if rc != 0:
+        logging.error("Failed to set GECOS for %s: %s", user, err)
+        return False
+    logging.debug("Updated GECOS for %s: %s", user, safe_comment)
+    return True
+
 # Function: fncEnsureUserGroup
 # Purpose : Ensure user membership in a single group matches `present`.
 # Notes   : Combines add/remove; used by higher-level helpers.
@@ -962,16 +1130,21 @@ def fncSetInitialPassword(user: str) -> bool:
     return True
 
 # Function: fncLoadState
-# Purpose : Load persistent state (known + disabled users).
+# Purpose : Load persistent state (known + disabled users + tiered accounts).
 # Notes   : Returns defaults on error or missing file.
 def fncLoadState() -> dict:
+    defaults = {"known_users": [], "disabled": {}, "tiered_users": []}
     if not os.path.exists(STATE_PATH):
-        return {"known_users": [], "disabled": {}}
+        return defaults
     try:
         with open(STATE_PATH, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Back-fill any keys missing from older state files
+        for k, v in defaults.items():
+            data.setdefault(k, v)
+        return data
     except Exception:
-        return {"known_users": [], "disabled": {}}
+        return defaults
 
 # Function: fncSaveState
 # Purpose : Persist state atomically with safe perms.
@@ -1082,6 +1255,290 @@ def fncPveEnsureAclRoles(userid: str, roles: set[str], path: str = "/") -> None:
             logging.error("PVE ACL add failed: user=%s role=%s path=%s err=%s", userid, role, path, err)
         else:
             logging.info("PVE ACL ensured: %s @ %s role=%s", userid, path, role)
+
+#==================================================================#
+#              Remote API client (PBS / PDM shared)               #
+#==================================================================#
+
+def _fncDecryptTokenValue(enc_value: str) -> str | None:
+    """Decrypt a Fernet-encrypted API token value using the key file."""
+    if not enc_value:
+        return None
+    if enc_value.startswith("fernet:"):
+        from cryptography.fernet import Fernet
+        key_b64 = os.getenv("ENTRAMOX_ENC_KEY", "").strip()
+        if not key_b64:
+            logging.error("Missing ENTRAMOX_ENC_KEY to decrypt remote API token")
+            return None
+        try:
+            return Fernet(key_b64.encode()).decrypt(enc_value.split(":", 1)[1].encode()).decode()
+        except Exception as e:
+            logging.error("Failed to decrypt remote API token: %s", e)
+            return None
+    return enc_value  # plaintext fallback
+
+
+def _fncRemoteApiRequest(
+    base_url: str,
+    path: str,
+    method: str = "GET",
+    data: dict | None = None,
+    auth_header: str = "",
+    verify_tls: bool = True,
+    timeout: int = 10,
+) -> dict | None:
+    """
+    Generic HTTPS REST client for PBS and PDM.
+    Returns the parsed JSON response dict or None on error.
+    """
+    url = base_url.rstrip("/") + "/" + path.lstrip("/")
+    headers: dict = {"Accept": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+
+    body = None
+    if data is not None:
+        body = _urlparse.urlencode(data).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+    req = _urlreq.Request(url, data=body, headers=headers, method=method)
+
+    ctx: ssl.SSLContext | None = None
+    if not verify_tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        with _urlreq.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return json.loads(resp.read().decode())
+    except HTTPError as e:
+        try:
+            body_txt = e.read().decode(errors="ignore")
+            logging.error("Remote API HTTP %s %s %s: %s", method, url, e.code, body_txt[:200])
+        except Exception:
+            logging.error("Remote API HTTP %s %s %s", method, url, e.code)
+        return None
+    except Exception as e:
+        logging.error("Remote API request failed %s %s: %s", method, url, e)
+        return None
+
+
+#=======================#
+# Proxmox Backup Server #
+#=======================#
+
+def _fncPbsBaseUrl() -> str:
+    return f"https://{PBS_HOST}:{PBS_PORT}/api2/json"
+
+def _fncPbsAuthHeader() -> str:
+    token_val = _fncDecryptTokenValue(PBS_TOKEN_VALUE_ENC)
+    if not token_val:
+        return ""
+    return f"PVEAPIToken={PBS_API_USER}!{PBS_TOKEN_NAME}={token_val}"
+
+def fncPbsUseridFromUpn(upn: str) -> str:
+    realm = (PBS_REALM or REALM).strip()
+    return f"{upn}@{realm}"
+
+def fncPbsUserExists(userid: str) -> bool:
+    resp = _fncRemoteApiRequest(
+        _fncPbsBaseUrl(), "access/users",
+        auth_header=_fncPbsAuthHeader(), verify_tls=PBS_VERIFY_TLS,
+    )
+    if resp is None:
+        return False
+    try:
+        return any((u.get("userid") or "") == userid for u in (resp.get("data") or []))
+    except Exception:
+        return False
+
+def fncPbsEnsureUser(
+    upn: str,
+    enabled: bool = True,
+    email: str | None = None,
+    comment: str | None = None,
+    firstname: str | None = None,
+    lastname: str | None = None,
+    role: str | None = None,
+) -> bool:
+    """Create or update a PBS user account, and ensure a role at /."""
+    if not PBS_ENABLED or not PBS_HOST:
+        return False
+    auth = _fncPbsAuthHeader()
+    if not auth:
+        logging.error("PBS auth header missing; check PBS_API_USER/PBS_TOKEN_NAME/PBS_TOKEN_VALUE_ENC")
+        return False
+
+    userid = fncPbsUseridFromUpn(upn)
+    base = _fncPbsBaseUrl()
+    exists = fncPbsUserExists(userid)
+
+    params: dict = {"enable": 1 if enabled else 0}
+    if email:     params["email"]     = email
+    if comment:   params["comment"]   = comment
+    if firstname: params["firstname"] = firstname
+    if lastname:  params["lastname"]  = lastname
+
+    if not exists:
+        params["userid"] = userid
+        resp = _fncRemoteApiRequest(base, "access/users", method="POST",
+                                    data=params, auth_header=auth, verify_tls=PBS_VERIFY_TLS)
+        if resp is None:
+            logging.error("PBS user create failed for %s", userid)
+            return False
+        logging.info("PBS user created: %s (enable=%s)", userid, int(enabled))
+        fncAuditEvent("PBS_USER_CREATED", {"userid": userid, "enabled": enabled})
+    else:
+        resp = _fncRemoteApiRequest(
+            base, f"access/users/{_urlparse.quote(userid, safe='')}",
+            method="PUT", data=params, auth_header=auth, verify_tls=PBS_VERIFY_TLS)
+        if resp is None:
+            logging.error("PBS user modify failed for %s", userid)
+            return False
+        logging.info("PBS user updated: %s (enable=%s)", userid, int(enabled))
+
+    # Ensure role at datastore root if enabled and role given
+    if enabled and role:
+        acl_data = {
+            "path": "/",
+            "role": role,
+            "userid": userid,
+            "propagate": 1,
+        }
+        acl_resp = _fncRemoteApiRequest(base, "access/acl", method="PUT",
+                                        data=acl_data, auth_header=auth, verify_tls=PBS_VERIFY_TLS)
+        if acl_resp is None:
+            logging.error("PBS ACL set failed: user=%s role=%s", userid, role)
+        else:
+            logging.info("PBS ACL set: %s role=%s @ /", userid, role)
+
+    return True
+
+def fncPbsUserSetEnabled(upn: str, enabled: bool) -> bool:
+    """Enable or disable a PBS user account."""
+    if not PBS_ENABLED or not PBS_HOST:
+        return False
+    userid = fncPbsUseridFromUpn(upn)
+    auth = _fncPbsAuthHeader()
+    if not auth:
+        return False
+    resp = _fncRemoteApiRequest(
+        _fncPbsBaseUrl(), f"access/users/{_urlparse.quote(userid, safe='')}",
+        method="PUT", data={"enable": 1 if enabled else 0},
+        auth_header=auth, verify_tls=PBS_VERIFY_TLS)
+    if resp is None:
+        logging.error("PBS user enable-toggle failed for %s", userid)
+        return False
+    logging.info("PBS user %s set enable=%s", userid, int(enabled))
+    fncAuditEvent("PBS_USER_TOGGLED", {"userid": userid, "enabled": enabled})
+    return True
+
+
+#=================================#
+# Proxmox Datacenter Manager (PDM)#
+#=================================#
+
+def _fncPdmBaseUrl() -> str:
+    return f"https://{PDM_HOST}:{PDM_PORT}/api2/json"
+
+def _fncPdmAuthHeader() -> str:
+    token_val = _fncDecryptTokenValue(PDM_TOKEN_VALUE_ENC)
+    if not token_val:
+        return ""
+    return f"PVEAPIToken={PDM_API_USER}!{PDM_TOKEN_NAME}={token_val}"
+
+def fncPdmUseridFromUpn(upn: str) -> str:
+    realm = (PDM_REALM or REALM).strip()
+    return f"{upn}@{realm}"
+
+def fncPdmUserExists(userid: str) -> bool:
+    resp = _fncRemoteApiRequest(
+        _fncPdmBaseUrl(), "access/users",
+        auth_header=_fncPdmAuthHeader(), verify_tls=PDM_VERIFY_TLS,
+    )
+    if resp is None:
+        return False
+    try:
+        return any((u.get("userid") or "") == userid for u in (resp.get("data") or []))
+    except Exception:
+        return False
+
+def fncPdmEnsureUser(
+    upn: str,
+    enabled: bool = True,
+    email: str | None = None,
+    comment: str | None = None,
+    firstname: str | None = None,
+    lastname: str | None = None,
+    role: str | None = None,
+) -> bool:
+    """Create or update a PDM user account, and ensure a role at /."""
+    if not PDM_ENABLED or not PDM_HOST:
+        return False
+    auth = _fncPdmAuthHeader()
+    if not auth:
+        logging.error("PDM auth header missing; check PDM_API_USER/PDM_TOKEN_NAME/PDM_TOKEN_VALUE_ENC")
+        return False
+
+    userid = fncPdmUseridFromUpn(upn)
+    base = _fncPdmBaseUrl()
+    exists = fncPdmUserExists(userid)
+
+    params: dict = {"enable": 1 if enabled else 0}
+    if email:     params["email"]     = email
+    if comment:   params["comment"]   = comment
+    if firstname: params["firstname"] = firstname
+    if lastname:  params["lastname"]  = lastname
+
+    if not exists:
+        params["userid"] = userid
+        resp = _fncRemoteApiRequest(base, "access/users", method="POST",
+                                    data=params, auth_header=auth, verify_tls=PDM_VERIFY_TLS)
+        if resp is None:
+            logging.error("PDM user create failed for %s", userid)
+            return False
+        logging.info("PDM user created: %s (enable=%s)", userid, int(enabled))
+        fncAuditEvent("PDM_USER_CREATED", {"userid": userid, "enabled": enabled})
+    else:
+        resp = _fncRemoteApiRequest(
+            base, f"access/users/{_urlparse.quote(userid, safe='')}",
+            method="PUT", data=params, auth_header=auth, verify_tls=PDM_VERIFY_TLS)
+        if resp is None:
+            logging.error("PDM user modify failed for %s", userid)
+            return False
+        logging.info("PDM user updated: %s (enable=%s)", userid, int(enabled))
+
+    if enabled and role:
+        acl_data = {"path": "/", "role": role, "userid": userid, "propagate": 1}
+        acl_resp = _fncRemoteApiRequest(base, "access/acl", method="PUT",
+                                        data=acl_data, auth_header=auth, verify_tls=PDM_VERIFY_TLS)
+        if acl_resp is None:
+            logging.error("PDM ACL set failed: user=%s role=%s", userid, role)
+        else:
+            logging.info("PDM ACL set: %s role=%s @ /", userid, role)
+
+    return True
+
+def fncPdmUserSetEnabled(upn: str, enabled: bool) -> bool:
+    """Enable or disable a PDM user account."""
+    if not PDM_ENABLED or not PDM_HOST:
+        return False
+    userid = fncPdmUseridFromUpn(upn)
+    auth = _fncPdmAuthHeader()
+    if not auth:
+        return False
+    resp = _fncRemoteApiRequest(
+        _fncPdmBaseUrl(), f"access/users/{_urlparse.quote(userid, safe='')}",
+        method="PUT", data={"enable": 1 if enabled else 0},
+        auth_header=auth, verify_tls=PDM_VERIFY_TLS)
+    if resp is None:
+        logging.error("PDM user enable-toggle failed for %s", userid)
+        return False
+    logging.info("PDM user %s set enable=%s", userid, int(enabled))
+    fncAuditEvent("PDM_USER_TOGGLED", {"userid": userid, "enabled": enabled})
+    return True
+
 
 #==============================================================#
 #                        Microsoft Graph                       #
@@ -1442,8 +1899,8 @@ def _graceDeleteOrCountdown(user: str, disabled: dict, known: set, unix_to_upn: 
 
         # Update PVE comment
         upn = unix_to_upn.get(user)
-        src_label = _pickSourceGroupName(upn, []) if upn else None
-        _setPveDeletionComment(user, now, unix_to_upn, src_label)
+        src_labels = _pickAllSourceGroupNames(upn, []) if upn else []
+        _setPveDeletionComment(user, now, unix_to_upn, src_labels)
 
         return
 
@@ -1459,8 +1916,8 @@ def _graceDeleteOrCountdown(user: str, disabled: dict, known: set, unix_to_upn: 
 
     # Refresh comment every run (keeps timestamp accurate if state file edited)
     upn = unix_to_upn.get(user)
-    src_label = _pickSourceGroupName(upn, []) if upn else None
-    _setPveDeletionComment(user, locked_at, unix_to_upn, src_label)
+    src_labels = _pickAllSourceGroupNames(upn, []) if upn else []
+    _setPveDeletionComment(user, locked_at, unix_to_upn, src_labels)
 
     # Expiry check
     if now - locked_at >= DELETE_AFTER:
@@ -1486,20 +1943,20 @@ def _ensureBaselineGroups(user: str):
 # Purpose : Main reconciliation loop. Create/lock/delete local + PVE users according to Entra groups & flags.
 # Notes   : Fail-open behavior when Graph not available; preserves existing users in realm to avoid mass-delete.
 def fncSync():
-    required_bins = ["pvesh","pveum","useradd","usermod","userdel","passwd","chage", "chpasswd","visudo","getent","id","groupadd","gpasswd"]
+    required_bins = ["pvesh", "pveum", "useradd", "usermod", "userdel", "passwd", "chage", "chpasswd", "visudo", "getent", "id", "groupadd", "gpasswd"]
     for key in required_bins:
         if not os.path.exists(BIN.get(key, "")):
             logging.error("Missing required binary: %s -> %s", key, BIN.get(key))
 
     # Load state
     state = fncLoadState()
-    known = set(state.get("known_users", []))
-    disabled = state.get("disabled", {})  # {username: iso_timestamp_locked}
+    known        = set(state.get("known_users", []))
+    disabled     = state.get("disabled", {})      # {username: iso_timestamp_locked}
+    tiered_known = set(state.get("tiered_users", []))  # tiered account names
 
-    # ----------------- Pull Graph -----------------
+    # ── Pull Graph ─────────────────────────────────────────────────────────────
     groups: list[dict] = []
     token = None
-
     graph_required = bool(GRAPH_ENFORCE and GRAPH_GROUP_IDS)
 
     if graph_required:
@@ -1513,7 +1970,6 @@ def fncSync():
             else:
                 fncPrintGroupReport(groups)
 
-
     # Compute desired + helper maps
     desired_unix, user_roles_by_upn, unix_to_upn, upn_enabled_global, in_allusers_upn, in_superadmin_upn = _computeDesiredFromGraph(groups)
 
@@ -1525,61 +1981,71 @@ def fncSync():
         logging.warning("Graph empty/unavailable; falling back to PVE realm users as desired.")
     logging.info("Desired (unix)=%s", sorted(desired_unix))
 
+    # ── Compute desired tiered accounts (superadmins only) ─────────────────────
+    desired_tiered_unix: set[str] = set()
+    if TIERED_ACCOUNTS and TIERED_ACCOUNT_VALUE:
+        for _upn in in_superadmin_upn:
+            _base = fncUpnToUnix(_upn)
+            if _base and _base not in RESERVED_USERS:
+                _tiered = fncMakeTieredUsername(_base)
+                if _tiered and _tiered != _base and _tiered not in RESERVED_USERS:
+                    desired_tiered_unix.add(_tiered)
+        if desired_tiered_unix:
+            logging.info("Desired tiered accounts: %s", sorted(desired_tiered_unix))
+
     # Candidates we might need to hold if not desired
     realm_present = fncGetAllPveUsersForRealm(REALM)
+    candidates    = known | realm_present
 
-    candidates = known | realm_present
-
-    # ----------------- 1) Hold/Delete: users not in any allowed group -----------------
-    to_hold = (candidates | known) - desired_unix
+    # ── 1) Hold/Delete: users not in any allowed group ─────────────────────────
+    # Exclude tiered accounts from the grace-delete logic (handled separately).
+    to_hold = (candidates | known) - desired_unix - tiered_known
     for user in sorted(to_hold):
         _graceDeleteOrCountdown(user, disabled, known, unix_to_upn)
 
-    # ----------------- 2) Ensure/Create: users in allowed groups -----------------
+    # ── 1b) Tiered account cleanup: remove if user is no longer a superadmin ───
+    orphaned_tiered = tiered_known - desired_tiered_unix
+    for tiered_user in sorted(orphaned_tiered):
+        if fncUserExists(tiered_user):
+            fncRemoveSudoers(tiered_user)
+            fncRemoveUserFromGroup(tiered_user, "sudo")
+            fncLockUser(tiered_user)
+            fncDeleteUser(tiered_user)
+            logging.info("Tiered account removed (no longer superadmin): %s", tiered_user)
+            fncAuditEvent("TIERED_ACCOUNT_DELETED", {"tiered_user": tiered_user})
+        disabled.pop(tiered_user, None)
+        tiered_known.discard(tiered_user)
+
+    # ── 2) Ensure/Create: users in allowed groups ──────────────────────────────
     for user in sorted(desired_unix):
         if user in RESERVED_USERS:
             continue
 
         # Create if missing, then set initial password
-        if not fncUserExists(user):
+        is_new = not fncUserExists(user)
+        if is_new:
             if fncCreateUser(user):
                 fncSetInitialPassword(user)
+                fncAuditEvent("USER_CREATED", {"user": user})
 
         # Map back to UPN for decisions; default to True when flags missing
-        upn = unix_to_upn.get(user)
+        upn          = unix_to_upn.get(user)
         entra_enabled = upn_enabled_global.get(upn, True) if upn is not None else True
+        is_superadmin = (upn in in_superadmin_upn) if upn else False
 
+        # Build group names for description (used in GECOS + PVE comment)
+        src_labels: list[str] = _pickAllSourceGroupNames(upn, groups) if upn and groups else []
+
+        # ── Entra-disabled: in group but account disabled in Entra ──────────────
         if not entra_enabled:
-            # Entra user is disabled but still appears in allow-groups.
-            # Policy: lock locally + strip sudo, and disable the PVE user.
-            # IMPORTANT: do NOT schedule deletion (no 24h countdown) — this is a reversible state.
-
             fncLockUser(user)
-
-            # Ensure we don't accidentally delete later because of a stale "disabled" timer
             disabled.pop(user, None)
-
-            # Always remove sudo privileges in this state
             fncRemoveSudoers(user)
             fncRemoveUserFromGroup(user, "sudo")
 
-            # Best-effort: disable the matching PVE account (enable=0), and update metadata if we have it
-            upn = unix_to_upn.get(user)
             if upn:
-                src_label = None
-                meta = {}
-
                 try:
-                    src_label = _pickSourceGroupName(upn, groups) if groups else None
-                    meta = _lookupUserMeta(upn, groups) if groups else {}
-                except Exception as e:
-                    logging.debug("Metadata lookup failed for %s: %s", upn, e)
-
-                comment = f"Synced from Entra via {src_label} Group" if src_label else "Synced from Entra"
-
-
-                try:
-                    # Ensure the PVE user exists, but mark disabled
+                    meta, comment = _buildPveMetaForUpn(upn, groups)
                     fncPveEnsureUser(
                         upn,
                         enabled=False,
@@ -1590,32 +2056,53 @@ def fncSync():
                     )
                 except Exception as e:
                     logging.error("PVE disable/update failed for %s: %s", upn, e)
+
+                if PBS_ENABLED:
+                    fncPbsUserSetEnabled(upn, False)
+                if PDM_ENABLED:
+                    fncPdmUserSetEnabled(upn, False)
             else:
-                logging.debug("Entra-disabled user %s: could not map back to UPN for PVE disable.", user)
+                logging.debug("Entra-disabled user %s: could not map to UPN for PVE/PBS/PDM disable.", user)
 
             known.add(user)
             continue
 
-
-        # Entra enabled → ensure unlocked and baseline non-priv groups
+        # ── Entra enabled ────────────────────────────────────────────────────────
         fncUnlockUser(user)
         _ensureBaselineGroups(user)
 
-        # SUDO policy: only superadmins get sudo + optional sudoers file
-        is_superadmin = (upn in in_superadmin_upn) if upn else False
+        # Set Linux GECOS to show which Entra group(s) granted the account
+        if src_labels:
+            if len(src_labels) == 1:
+                gecos = f"Synced via '{src_labels[0]}' Group"
+            else:
+                gecos = "Synced via Groups: " + ", ".join(f"'{n}'" for n in src_labels)
+        else:
+            gecos = "Synced from Entra"
+        fncSetLinuxGecos(user, gecos)
+
+        # ── SUDO policy ──────────────────────────────────────────────────────────
+        # When tiered accounts are active the BASE account gets NO sudo — privileges
+        # live exclusively in the tiered account (created below).
+        tiered_active = TIERED_ACCOUNTS and bool(TIERED_ACCOUNT_VALUE)
         if is_superadmin:
-            fncAddUserToGroups(user, ["sudo"])
-            if GRANT_SUDO:
-                fncGrantSudo(user)
+            if tiered_active:
+                # Base account: strip sudo (tiered account carries it)
+                fncRemoveSudoers(user)
+                fncRemoveUserFromGroup(user, "sudo")
+            else:
+                fncAddUserToGroups(user, ["sudo"])
+                if GRANT_SUDO:
+                    fncGrantSudo(user)
+                fncAuditEvent("SUDO_GRANTED", {"user": user})
         else:
             fncRemoveSudoers(user)
             fncRemoveUserFromGroup(user, "sudo")
 
-        # PVE user ensure + roles
+        # ── PVE user ensure + roles ──────────────────────────────────────────────
         if upn:
             try:
                 meta, comment = _buildPveMetaForUpn(upn, groups)
-
                 fncPveEnsureUser(
                     upn,
                     enabled=True,
@@ -1627,10 +2114,15 @@ def fncSync():
 
                 roles = set(user_roles_by_upn.get(upn, set()))
 
-                # If user ends up only in AllUsers and it has a mapped role, ensure it
+                # AllUsers baseline role
                 if ENTRA_ALLUSERS_GROUP_ID and ENTRA_ALLUSERS_PVE_ROLE:
                     if (upn in in_allusers_upn) and not roles:
                         roles = {ENTRA_ALLUSERS_PVE_ROLE}
+
+                # Tiered scope "linux": superadmin PVE role is NOT granted via base account.
+                # Scope "both": grant PVE admin role as well (user also gets the tiered Linux account).
+                if is_superadmin and tiered_active and TIERED_ACCOUNT_SCOPE != "both":
+                    roles.discard(ENTRA_SUPERADMIN_PVE_ROLE)
 
                 if roles:
                     fncPveEnsureAclRoles(fncPveUseridFromUpn(upn), roles, path="/")
@@ -1638,16 +2130,82 @@ def fncSync():
             except Exception as e:
                 logging.error("PVE provisioning failed for %s: %s", upn, e)
 
+            # ── PBS sync ─────────────────────────────────────────────────────────
+            if PBS_ENABLED:
+                try:
+                    meta, comment = _buildPveMetaForUpn(upn, groups)
+                    pbs_role = PBS_ADMIN_ROLE if is_superadmin else PBS_DEFAULT_ROLE
+                    fncPbsEnsureUser(upn, enabled=True, email=meta.get("mail"),
+                                     comment=comment, firstname=meta.get("givenName"),
+                                     lastname=meta.get("surname"), role=pbs_role)
+                except Exception as e:
+                    logging.error("PBS provisioning failed for %s: %s", upn, e)
 
-        # Clear “disabled” state if present and mark known
+            # ── PDM sync ─────────────────────────────────────────────────────────
+            if PDM_ENABLED:
+                try:
+                    meta, comment = _buildPveMetaForUpn(upn, groups)
+                    pdm_role = PDM_ADMIN_ROLE if is_superadmin else PDM_DEFAULT_ROLE
+                    fncPdmEnsureUser(upn, enabled=True, email=meta.get("mail"),
+                                     comment=comment, firstname=meta.get("givenName"),
+                                     lastname=meta.get("surname"), role=pdm_role)
+                except Exception as e:
+                    logging.error("PDM provisioning failed for %s: %s", upn, e)
+
         disabled.pop(user, None)
         known.add(user)
 
-    # ----------------- Persist -----------------
-    state["known_users"] = sorted(known)
-    state["disabled"] = disabled
+    # ── 3) Tiered account create/update (superadmins only) ─────────────────────
+    if TIERED_ACCOUNTS and TIERED_ACCOUNT_VALUE:
+        for base_user in sorted(desired_unix):
+            if base_user in RESERVED_USERS:
+                continue
+            upn = unix_to_upn.get(base_user)
+            if not upn or upn not in in_superadmin_upn:
+                continue
+
+            tiered_user = fncMakeTieredUsername(base_user)
+            if not tiered_user or tiered_user == base_user or tiered_user in RESERVED_USERS:
+                continue
+
+            entra_enabled = upn_enabled_global.get(upn, True)
+
+            if not fncUserExists(tiered_user):
+                if fncCreateUser(tiered_user):
+                    fncSetInitialPassword(tiered_user)
+                    logging.info("Created tiered account '%s' for base user '%s'", tiered_user, base_user)
+                    fncAuditEvent("TIERED_ACCOUNT_CREATED", {"tiered_user": tiered_user, "base_user": base_user})
+
+            if entra_enabled:
+                fncUnlockUser(tiered_user)
+                _ensureBaselineGroups(tiered_user)
+                fncAddUserToGroups(tiered_user, ["sudo"])
+                if GRANT_SUDO:
+                    fncGrantSudo(tiered_user)
+
+                # GECOS for tiered account
+                src_labels_t = _pickAllSourceGroupNames(upn, groups) if groups else []
+                tier_gecos = f"Admin tier for {base_user}"
+                if src_labels_t:
+                    tier_gecos += " (via " + ", ".join(f"'{n}'" for n in src_labels_t) + ")"
+                fncSetLinuxGecos(tiered_user, tier_gecos)
+            else:
+                fncLockUser(tiered_user)
+                fncRemoveSudoers(tiered_user)
+                fncRemoveUserFromGroup(tiered_user, "sudo")
+
+            disabled.pop(tiered_user, None)
+            tiered_known.add(tiered_user)
+
+    # ── Persist ─────────────────────────────────────────────────────────────────
+    state["known_users"]  = sorted(known)
+    state["disabled"]     = disabled
+    state["tiered_users"] = sorted(tiered_known)
     fncSaveState(state)
-    logging.info("Sync complete. Known=%d, Desired=%d, Disabled=%d", len(known), len(desired_unix), len(disabled))
+    logging.info(
+        "Sync complete. Known=%d, Desired=%d, Disabled=%d, Tiered=%d",
+        len(known), len(desired_unix), len(disabled), len(tiered_known)
+    )
 
 #=================#
 # Script harness  #

@@ -18,7 +18,7 @@ from datetime import datetime
 ROOT_DIR = Path(__file__).resolve().parent
 SCRIPT_SRC = ROOT_DIR / "entramoxreconciler.py"
 REQS = ROOT_DIR / "requirements.txt"
-VERSION = "2.0.0a"
+VERSION = "2.5.0"
 
 # ============================================================
 # NEW: entramoxreconciler (current installation target)
@@ -88,7 +88,12 @@ VERSION_INFO = f"""
 |             reserved users, domain filter,  |
 |             sudo allow-list, logrotate.     |
 | 26/12/2025: Renamed Script to something     |
-              useful.                         |
+|             useful.                         |
+| 09/04/2026: v2.5 - PBS + PDM integration,   |
+|             tiered account support,         |
+|             multi-group user descriptions,  |
+|             structured SIEM audit log,      |
+|             improved security model.        |
 ==============================================
 """
 
@@ -596,6 +601,176 @@ def fncBuildEnvfileContent() -> str:
             "AUTH_MODE='application'",
         ]
         fncOk("Encrypted ENTR_CLNT_SEC and stored ENTR_CLNT_SEC_ENC in env.")
+
+    # ── Tiered accounts ────────────────────────────────────────────────────────
+    print()
+    fncHeading("== Tiered Accounts (privilege separation) ==")
+    fncInfo("Tiered accounts create a second privileged login for superadmin users.")
+    fncInfo(f"Example: base account {fncColor('john', 'cyan')} (no sudo) + tiered account "
+            f"{fncColor('a-john', 'cyan')} (with sudo).")
+    fncInfo("This enforces least-privilege — daily work uses the regular account.")
+
+    tiered = ask_bool("Enable tiered accounts for superadmin users?", default=False)
+    if tiered:
+        print()
+        fncHeading("== Tiered Account: Prefix or Suffix? ==")
+        print(f"{fncColor('[1]', 'white')} Prefix — e.g. {fncColor('a-john', 'cyan')} (prefix {fncColor('a-', 'yellow')})")
+        print(f"{fncColor('[2]', 'white')} Suffix — e.g. {fncColor('john-adm', 'cyan')} (suffix {fncColor('-adm', 'yellow')})")
+        while True:
+            tier_mode_raw = input(
+                f"{fncColor('?', 'cyan')} Choose {fncColor('[1/2]', 'white')} [{fncColor('1', 'green')}]: "
+            ).strip() or "1"
+            if tier_mode_raw in ("1", "2"):
+                break
+            fncWarn("Please enter 1 or 2.")
+        tier_mode = "prefix" if tier_mode_raw == "1" else "suffix"
+
+        mode_label = "prefix" if tier_mode == "prefix" else "suffix"
+        default_val = "a-" if tier_mode == "prefix" else "-adm"
+        tier_value = ask_nonempty(
+            f"Enter the {mode_label} value (e.g. {fncColor(default_val, 'yellow')})",
+            default=default_val,
+        )
+
+        print()
+        fncHeading("== Tiered Account Scope ==")
+        fncInfo("Choose whether the tiered account applies to Linux only, or also to Proxmox (PVE/PBS/PDM).")
+        fncInfo(f"{fncColor('Linux only', 'cyan')}: tiered user gets sudo; Proxmox admin role is unchanged.")
+        fncInfo(f"{fncColor('Linux + Proxmox', 'cyan')}: tiered user gets sudo AND Proxmox admin role.")
+        print(f"{fncColor('[1]', 'white')} Linux only")
+        print(f"{fncColor('[2]', 'white')} Linux and Proxmox")
+        while True:
+            scope_raw = input(
+                f"{fncColor('?', 'cyan')} Choose {fncColor('[1/2]', 'white')} [{fncColor('1', 'green')}]: "
+            ).strip() or "1"
+            if scope_raw in ("1", "2"):
+                break
+            fncWarn("Please enter 1 or 2.")
+        tier_scope = "linux" if scope_raw == "1" else "both"
+
+        lines += [
+            "",
+            "# Tiered accounts",
+            "TIERED_ACCOUNTS='true'",
+            f"TIERED_ACCOUNT_MODE={fncShQuote(tier_mode)}",
+            f"TIERED_ACCOUNT_VALUE={fncShQuote(tier_value)}",
+            f"TIERED_ACCOUNT_SCOPE={fncShQuote(tier_scope)}",
+        ]
+        fncOk(f"Tiered accounts enabled: {tier_mode} '{tier_value}', scope={tier_scope}")
+    else:
+        lines += [
+            "",
+            "# Tiered accounts (disabled)",
+            "TIERED_ACCOUNTS='false'",
+            "TIERED_ACCOUNT_MODE='prefix'",
+            "TIERED_ACCOUNT_VALUE=''",
+            "TIERED_ACCOUNT_SCOPE='linux'",
+        ]
+
+    # ── Proxmox Backup Server (PBS) ───────────────────────────────────────────
+    print()
+    fncHeading("== Proxmox Backup Server (PBS) Integration ==")
+    fncInfo("Optionally sync users into a PBS instance so they can log in to manage backups.")
+
+    pbs = ask_bool("Enable PBS user synchronisation?", default=False)
+    if pbs:
+        pbs_host     = ask_nonempty("PBS hostname or IP (PBS_HOST)")
+        pbs_port     = input(fncColor(f"PBS API port [{fncColor('8007', 'green')}]: ", "cyan", "bold")).strip() or "8007"
+        pbs_realm    = input(fncColor("PBS realm for synced users (blank = use PVE realm): ", "cyan", "bold")).strip()
+        pbs_api_user = ask_nonempty("PBS API user (e.g. root@pam)", default="root@pam")
+        pbs_tok_name = ask_nonempty("PBS API token name")
+        pbs_tok_val  = getpass(fncColor("PBS API token value [input hidden]: ", "cyan", "bold")).strip()
+
+        # Encrypt token
+        enc_key = fncLoadEncKey()
+        if not enc_key:
+            fncWarn("Encryption key missing — PBS token stored as plaintext. Run encrypt-secrets after install.")
+            pbs_tok_enc = pbs_tok_val
+        else:
+            try:
+                pbs_tok_enc = fncEncryptSecretFernet(pbs_tok_val, enc_key)
+                fncOk("PBS API token encrypted.")
+            except Exception as e:
+                fncWarn(f"Encryption failed ({e}); storing plaintext.")
+                pbs_tok_enc = pbs_tok_val
+
+        pbs_verify = ask_bool("Verify TLS certificate for PBS?", default=True)
+        pbs_default_role = input(fncColor("Default PBS role for all users [DatastoreReader]: ", "cyan", "bold")).strip() or "DatastoreReader"
+        pbs_admin_role   = input(fncColor("PBS role for superadmins [DatastoreAdmin]: ", "cyan", "bold")).strip() or "DatastoreAdmin"
+
+        lines += [
+            "",
+            "# Proxmox Backup Server",
+            "PBS_ENABLED='true'",
+            f"PBS_HOST={fncShQuote(pbs_host)}",
+            f"PBS_PORT={fncShQuote(pbs_port)}",
+            f"PBS_REALM={fncShQuote(pbs_realm)}",
+            f"PBS_API_USER={fncShQuote(pbs_api_user)}",
+            f"PBS_TOKEN_NAME={fncShQuote(pbs_tok_name)}",
+            f"PBS_TOKEN_VALUE_ENC={fncShQuote(pbs_tok_enc)}",
+            f"PBS_VERIFY_TLS={fncShQuote('true' if pbs_verify else 'false')}",
+            f"PBS_DEFAULT_ROLE={fncShQuote(pbs_default_role)}",
+            f"PBS_ADMIN_ROLE={fncShQuote(pbs_admin_role)}",
+        ]
+        fncOk(f"PBS integration enabled: {pbs_api_user}@{pbs_host}:{pbs_port}")
+    else:
+        lines += [
+            "",
+            "# Proxmox Backup Server (disabled)",
+            "PBS_ENABLED='false'",
+        ]
+
+    # ── Proxmox Datacenter Manager (PDM) ─────────────────────────────────────
+    print()
+    fncHeading("== Proxmox Datacenter Manager (PDM) Integration ==")
+    fncInfo("Optionally sync users into a PDM instance for centralised datacenter management access.")
+
+    pdm = ask_bool("Enable PDM user synchronisation?", default=False)
+    if pdm:
+        pdm_host     = ask_nonempty("PDM hostname or IP (PDM_HOST)")
+        pdm_port     = input(fncColor(f"PDM API port [{fncColor('8443', 'green')}]: ", "cyan", "bold")).strip() or "8443"
+        pdm_realm    = input(fncColor("PDM realm for synced users (blank = use PVE realm): ", "cyan", "bold")).strip()
+        pdm_api_user = ask_nonempty("PDM API user (e.g. root@pam)", default="root@pam")
+        pdm_tok_name = ask_nonempty("PDM API token name")
+        pdm_tok_val  = getpass(fncColor("PDM API token value [input hidden]: ", "cyan", "bold")).strip()
+
+        enc_key = fncLoadEncKey()
+        if not enc_key:
+            fncWarn("Encryption key missing — PDM token stored as plaintext.")
+            pdm_tok_enc = pdm_tok_val
+        else:
+            try:
+                pdm_tok_enc = fncEncryptSecretFernet(pdm_tok_val, enc_key)
+                fncOk("PDM API token encrypted.")
+            except Exception as e:
+                fncWarn(f"Encryption failed ({e}); storing plaintext.")
+                pdm_tok_enc = pdm_tok_val
+
+        pdm_verify = ask_bool("Verify TLS certificate for PDM?", default=True)
+        pdm_default_role = input(fncColor("Default PDM role for all users [DCOperator]: ", "cyan", "bold")).strip() or "DCOperator"
+        pdm_admin_role   = input(fncColor("PDM role for superadmins [DCAdmin]: ", "cyan", "bold")).strip() or "DCAdmin"
+
+        lines += [
+            "",
+            "# Proxmox Datacenter Manager",
+            "PDM_ENABLED='true'",
+            f"PDM_HOST={fncShQuote(pdm_host)}",
+            f"PDM_PORT={fncShQuote(pdm_port)}",
+            f"PDM_REALM={fncShQuote(pdm_realm)}",
+            f"PDM_API_USER={fncShQuote(pdm_api_user)}",
+            f"PDM_TOKEN_NAME={fncShQuote(pdm_tok_name)}",
+            f"PDM_TOKEN_VALUE_ENC={fncShQuote(pdm_tok_enc)}",
+            f"PDM_VERIFY_TLS={fncShQuote('true' if pdm_verify else 'false')}",
+            f"PDM_DEFAULT_ROLE={fncShQuote(pdm_default_role)}",
+            f"PDM_ADMIN_ROLE={fncShQuote(pdm_admin_role)}",
+        ]
+        fncOk(f"PDM integration enabled: {pdm_api_user}@{pdm_host}:{pdm_port}")
+    else:
+        lines += [
+            "",
+            "# Proxmox Datacenter Manager (disabled)",
+            "PDM_ENABLED='false'",
+        ]
 
     return "\n".join(lines) + "\n"
 
