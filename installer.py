@@ -24,45 +24,48 @@ VERSION = "2.5.0"
 # NEW: entramoxreconciler (current installation target)
 # ============================================================
 SCRIPT_DST = Path("/usr/local/sbin/entramoxreconciler.py")
-CHECKER = Path("/usr/local/sbin/entramox_check.sh")
-SERVICE = Path("/etc/systemd/system/entramoxreconciler.service")
-TIMER = Path("/etc/systemd/system/entramoxreconciler.timer")
-LOGDIR = Path("/var/log/entramoxreconciler")
-ENVFILE = Path("/etc/entramoxreconciler.env")
-KEYFILE = Path("/etc/entramoxreconciler.key")
+CHECKER    = Path("/usr/local/sbin/entramox_check.sh")
+SERVICE    = Path("/etc/systemd/system/entramoxreconciler.service")
+TIMER      = Path("/etc/systemd/system/entramoxreconciler.timer")
+LOGDIR     = Path("/var/log/entramoxreconciler")
+ENVFILE    = Path("/etc/entramoxreconciler.env")
+KEYFILE    = Path("/etc/entramoxreconciler.key")
 
-# Updated ENC_KEY_ENV (new canonical name)
+# Per-service credential directory — secrets split from the main env file.
+# Each file is mode 0600 so a compromise of one service's token does not
+# expose the others. The directory itself is mode 0700.
+CONF_DIR    = Path("/etc/entramoxreconciler")
+GRAPH_ENVFILE = CONF_DIR / "graph.env"   # ENTR_CLNT_SEC_ENC / GRAPH_ACCESS_TOKEN
+PBS_ENVFILE   = CONF_DIR / "pbs.env"     # PBS_TOKEN_VALUE_ENC
+PDM_ENVFILE   = CONF_DIR / "pdm.env"     # PDM_TOKEN_VALUE_ENC
+
+# Separate baseline file — stores expected hashes independently of the
+# checker script so an attacker cannot just replace both atomically.
+BASELINE   = CONF_DIR / "baseline.sha256"
+
+# Vars extracted into per-service files (stripped from the main env)
+_GRAPH_SECRET_VARS = {"ENTR_CLNT_SEC_ENC", "GRAPH_ACCESS_TOKEN"}
+_PBS_SECRET_VARS   = {"PBS_TOKEN_VALUE_ENC"}
+_PDM_SECRET_VARS   = {"PDM_TOKEN_VALUE_ENC"}
+
+# Encryption key env var name
 ENC_KEY_ENV = "ENTRAMOX_ENC_KEY"
-
-# ============================================================
-# LEGACY: sudomatic5000 (for upgrades/migration)
-# ============================================================
-LEGACY_SCRIPT_DST = Path("/usr/local/sbin/sudomatic5000.py")
-LEGACY_CHECKER = Path("/usr/local/sbin/sudomatic_check.sh")
-LEGACY_SERVICE = Path("/etc/systemd/system/sudomatic.service")
-LEGACY_TIMER = Path("/etc/systemd/system/sudomatic.timer")
-LEGACY_LOGDIR = Path("/var/log/sudomatic5000")
-LEGACY_ENVFILE = Path("/etc/sudomatic5000.env")
-LEGACY_KEYFILE = Path("/etc/sudomatic5000.key")
-
-# Legacy key env var name (supported for upgrades)
-LEGACY_ENC_KEY_ENV = "SUDOMATIC_ENC_KEY"
 
 ENV_ASSIGN_RE = re.compile(
     r"""^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:'([^']*)'|"([^"]*)"|([^\s#]+))\s*(?:#.*)?$"""
 )
 
 BANNER = r"""
-  ______       _                                   _____                           _ _           
- |  ____|     | |                                 |  __ \                         (_) |          
- | |__   _ __ | |_ _ __ __ _ _ __ ___   _____  __ | |__) |___  ___ ___  _ __   ___ _| | ___ _ __ 
+  ______       _                                   _____                           _ _
+ |  ____|     | |                                 |  __ \                         (_) |
+ | |__   _ __ | |_ _ __ __ _ _ __ ___   _____  __ | |__) |___  ___ ___  _ __   ___ _| | ___ _ __
  |  __| | '_ \| __| '__/ _` | '_ ` _ \ / _ \ \/ / |  _  // _ \/ __/ _ \| '_ \ / __| | |/ _ \ '__|
- | |____| | | | |_| | | (_| | | | | | | (_) >  <  | | \ \  __/ (_| (_) | | | | (__| | |  __/ |   
- |______|_| |_|\__|_|  \__,_|_| |_| |_|\___/_/\_\ |_|  \_\___|\___\___/|_| |_|\___|_|_|\___|_|   
+ | |____| | | | |_| | | (_| | | | | | | (_) >  <  | | \ \  __/ (_| (_) | | | | (__| | |  __/ |
+ |______|_| |_|\__|_|  \__,_|_| |_| |_|\___/_/\_\ |_|  \_\___|\___\___/|_| |_|\___|_|_|\___|_|
                 Turning realms into real users, one sudo at a time.
                 ------------------------------------------------
                 ::        %INSERT RELEVANT DISCORD HERE       ::
-                :: https://github.com/deannreid/SUDOmatic5000 ::
+                :: https://github.com/deannreid/EntramoxReconciler ::
                 ------------------------------------------------
 """
 
@@ -94,6 +97,11 @@ VERSION_INFO = f"""
 |             multi-group user descriptions,  |
 |             structured SIEM audit log,      |
 |             improved security model.        |
+| 10/04/2026: Security hardening — Fernet TTL,|
+|             split credential files, retry  |
+|             backoff, MAX_USERS_PER_RUN,     |
+|             GRAPH_FAIL_POLICY, stale lock   |
+|             cleanup, audit log 0640.        |
 ==============================================
 """
 
@@ -206,61 +214,7 @@ def fncEnvBackupPath(p: Path) -> Path:
     return p.with_suffix(p.suffix + f".bak-{ts}")
 
 # ============================
-# Legacy adoption/migration
-# ============================
-def fncMaybeAdoptLegacyArtifacts():
-    """
-    If legacy sudomatic5000 artifacts exist and the new ones do not, adopt them
-    (move/rename into the new entramoxreconciler locations). Keeps backups for files.
-    Also migrates the key var name inside the key file if needed.
-    """
-    def adopt_file(src: Path, dst: Path, label: str):
-        if src.exists() and not dst.exists():
-            try:
-                backup = fncEnvBackupPath(src)
-                shutil.copy2(src, backup)
-                src.rename(dst)
-                fncOk(f"Adopted legacy {label}: {src} -> {dst} (backup: {backup})")
-            except Exception as e:
-                fncWarn(f"Could not adopt legacy {label} {src} -> {dst}: {e}")
-
-    def adopt_dir(src: Path, dst: Path, label: str):
-        if src.exists() and src.is_dir() and not dst.exists():
-            try:
-                src.rename(dst)
-                fncOk(f"Adopted legacy {label}: {src} -> {dst}")
-            except Exception as e:
-                fncWarn(f"Could not adopt legacy {label} {src} -> {dst}: {e}")
-
-    # adopt in a sensible order
-    adopt_file(LEGACY_ENVFILE, ENVFILE, "env file")
-    adopt_file(LEGACY_KEYFILE, KEYFILE, "key file")
-    adopt_file(LEGACY_SCRIPT_DST, SCRIPT_DST, "installed script")
-    adopt_file(LEGACY_CHECKER, CHECKER, "checker")
-    adopt_file(LEGACY_SERVICE, SERVICE, "service unit")
-    adopt_file(LEGACY_TIMER, TIMER, "timer unit")
-    adopt_dir(LEGACY_LOGDIR, LOGDIR, "log dir")
-
-    # Migrate key var name in KEYFILE if it still uses legacy var
-    if KEYFILE.exists():
-        try:
-            txt = KEYFILE.read_text()
-            if LEGACY_ENC_KEY_ENV in txt and ENC_KEY_ENV not in txt:
-                backup = fncEnvBackupPath(KEYFILE)
-                shutil.copy2(KEYFILE, backup)
-                new_txt = re.sub(
-                    rf"(?m)^\s*{re.escape(LEGACY_ENC_KEY_ENV)}\s*=",
-                    f"{ENC_KEY_ENV}=",
-                    txt,
-                )
-                KEYFILE.write_text(new_txt)
-                os.chmod(KEYFILE, 0o600)
-                fncOk(f"Migrated key var name inside {KEYFILE} ({LEGACY_ENC_KEY_ENV} -> {ENC_KEY_ENV}) (backup: {backup})")
-        except Exception as e:
-            fncWarn(f"Could not migrate key env var name inside {KEYFILE}: {e}")
-
-# ============================
-# Key helpers (supports legacy)
+# Key helpers
 # ============================
 def fncEnsureKeyfile():
     """Ensure KEYFILE exists with a Fernet key (mode 0600). Writes ENC_KEY_ENV going forward."""
@@ -288,19 +242,17 @@ def _fncParseKeyfile(path: Path) -> str | None:
                 continue
             if "=" in line:
                 k, v = line.split("=", 1)
-                k = k.strip()
-                if k in (ENC_KEY_ENV, LEGACY_ENC_KEY_ENV):
+                if k.strip() == ENC_KEY_ENV:
                     return v.strip()
     except Exception:
         return None
     return None
 
 def fncLoadEncKey() -> str | None:
-    """Prefer env (runtime), else the keyfile. Supports both new + legacy env var names."""
-    for var in (ENC_KEY_ENV, LEGACY_ENC_KEY_ENV):
-        val = os.environ.get(var, "").strip()
-        if val:
-            return val
+    """Prefer env (runtime), else the keyfile."""
+    val = os.environ.get(ENC_KEY_ENV, "").strip()
+    if val:
+        return val
     return _fncParseKeyfile(KEYFILE)
 
 def fncEncryptSecretFernet(secret: str, key_b64: str) -> str:
@@ -684,15 +636,14 @@ def fncBuildEnvfileContent() -> str:
         # Encrypt token
         enc_key = fncLoadEncKey()
         if not enc_key:
-            fncWarn("Encryption key missing — PBS token stored as plaintext. Run encrypt-secrets after install.")
-            pbs_tok_enc = pbs_tok_val
-        else:
-            try:
-                pbs_tok_enc = fncEncryptSecretFernet(pbs_tok_val, enc_key)
-                fncOk("PBS API token encrypted.")
-            except Exception as e:
-                fncWarn(f"Encryption failed ({e}); storing plaintext.")
-                pbs_tok_enc = pbs_tok_val
+            fncErr(f"Missing encryption key. Expected {KEYFILE} with {ENC_KEY_ENV}. Aborting to avoid writing PBS token as plaintext.")
+            sys.exit(1)
+        try:
+            pbs_tok_enc = fncEncryptSecretFernet(pbs_tok_val, enc_key)
+            fncOk("PBS API token encrypted.")
+        except Exception as e:
+            fncErr(f"Encryption failed ({e}). Aborting to avoid writing PBS token as plaintext.")
+            sys.exit(1)
 
         pbs_verify = ask_bool("Verify TLS certificate for PBS?", default=True)
         pbs_default_role = input(fncColor("Default PBS role for all users [DatastoreReader]: ", "cyan", "bold")).strip() or "DatastoreReader"
@@ -736,15 +687,14 @@ def fncBuildEnvfileContent() -> str:
 
         enc_key = fncLoadEncKey()
         if not enc_key:
-            fncWarn("Encryption key missing — PDM token stored as plaintext.")
-            pdm_tok_enc = pdm_tok_val
-        else:
-            try:
-                pdm_tok_enc = fncEncryptSecretFernet(pdm_tok_val, enc_key)
-                fncOk("PDM API token encrypted.")
-            except Exception as e:
-                fncWarn(f"Encryption failed ({e}); storing plaintext.")
-                pdm_tok_enc = pdm_tok_val
+            fncErr(f"Missing encryption key. Expected {KEYFILE} with {ENC_KEY_ENV}. Aborting to avoid writing PDM token as plaintext.")
+            sys.exit(1)
+        try:
+            pdm_tok_enc = fncEncryptSecretFernet(pdm_tok_val, enc_key)
+            fncOk("PDM API token encrypted.")
+        except Exception as e:
+            fncErr(f"Encryption failed ({e}). Aborting to avoid writing PDM token as plaintext.")
+            sys.exit(1)
 
         pdm_verify = ask_bool("Verify TLS certificate for PDM?", default=True)
         pdm_default_role = input(fncColor("Default PDM role for all users [DCOperator]: ", "cyan", "bold")).strip() or "DCOperator"
@@ -777,16 +727,112 @@ def fncBuildEnvfileContent() -> str:
 # ============================
 # Writers
 # ============================
+
+def fncSplitEnvfileIntoServices(content: str) -> tuple[str, str, str, str]:
+    """Split env file content into (main, graph, pbs, pdm) strings.
+
+    Secret vars (token values, client secrets) are moved into their own
+    per-service files.  The main file retains all non-secret config so
+    a read of it alone reveals no usable credentials.
+
+    Returns four strings: (main_content, graph_content, pbs_content, pdm_content).
+    """
+    main_lines: list[str] = []
+    graph_lines: list[str] = ["# Entramox Reconciler — Graph credentials (mode 0600)"]
+    pbs_lines:   list[str] = ["# Entramox Reconciler — PBS credentials (mode 0600)"]
+    pdm_lines:   list[str] = ["# Entramox Reconciler — PDM credentials (mode 0600)"]
+
+    # Track which service files got at least one real assignment
+    graph_has_vars = pbs_has_vars = pdm_has_vars = False
+
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        # Match KEY=value assignment (handles quoted and unquoted values)
+        m = ENV_ASSIGN_RE.match(stripped)
+        if m:
+            key = m.group(1)
+            if key in _GRAPH_SECRET_VARS:
+                graph_lines.append(raw_line)
+                graph_has_vars = True
+                # Leave a comment placeholder in the main file
+                main_lines.append(f"# {key} — moved to {GRAPH_ENVFILE}")
+                continue
+            if key in _PBS_SECRET_VARS:
+                pbs_lines.append(raw_line)
+                pbs_has_vars = True
+                main_lines.append(f"# {key} — moved to {PBS_ENVFILE}")
+                continue
+            if key in _PDM_SECRET_VARS:
+                pdm_lines.append(raw_line)
+                pdm_has_vars = True
+                main_lines.append(f"# {key} — moved to {PDM_ENVFILE}")
+                continue
+        main_lines.append(raw_line)
+
+    graph_content = "\n".join(graph_lines) + "\n" if graph_has_vars else ""
+    pbs_content   = "\n".join(pbs_lines)   + "\n" if pbs_has_vars  else ""
+    pdm_content   = "\n".join(pdm_lines)   + "\n" if pdm_has_vars  else ""
+    return "\n".join(main_lines) + "\n", graph_content, pbs_content, pdm_content
+
+
+def _ensure_conf_dir():
+    """Ensure /etc/entramoxreconciler/ exists with mode 0700."""
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONF_DIR, 0o700)
+
+
+def _write_secret_file(path: Path, content: str, label: str):
+    """Write a per-service secret file with mode 0600."""
+    if content.strip() and not content.strip().startswith("#"):
+        path.write_text(content, encoding="utf-8")
+        os.chmod(path, 0o600)
+        fncOk(f"Wrote {label} to " + fncColor(str(path), "white", "bold") + " (mode 0600)")
+    else:
+        # Nothing to write (service not configured); remove stale file if present
+        if path.exists():
+            path.unlink()
+            fncInfo(f"Removed stale {label} file: {path}")
+
+
 def fncWriteEnvfile(content: str):
+    """Write the main env file and split secrets into per-service files."""
+    _ensure_conf_dir()
+    main_content, graph_content, pbs_content, pdm_content = fncSplitEnvfileIntoServices(content)
+
+    # Write main config (no secrets)
     if ENVFILE.exists():
         fncInfo(f"Updating {ENVFILE}")
     else:
         fncOk(f"Creating {ENVFILE}")
-    ENVFILE.write_text(content)
+    ENVFILE.write_text(main_content, encoding="utf-8")
     os.chmod(ENVFILE, 0o600)
-    fncOk("Wrote secrets/config to " + fncColor(str(ENVFILE), "white", "bold") + " (mode 0600)")
+    fncOk("Wrote main config to " + fncColor(str(ENVFILE), "white", "bold") + " (mode 0600)")
+
+    # Write per-service credential files
+    _write_secret_file(GRAPH_ENVFILE, graph_content, "Graph credentials")
+    _write_secret_file(PBS_ENVFILE,   pbs_content,   "PBS credentials")
+    _write_secret_file(PDM_ENVFILE,   pdm_content,   "PDM credentials")
+
+    fncInfo(
+        "Secrets split into separate files: "
+        + fncColor(str(GRAPH_ENVFILE), "white") + ", "
+        + fncColor(str(PBS_ENVFILE),   "white") + ", "
+        + fncColor(str(PDM_ENVFILE),   "white")
+    )
 
 def fncWriteChecker(expected_sha: str):
+    """Write the integrity checker script and the separate baseline hash file.
+
+    Security rationale for the separate baseline file:
+      Previously the expected hashes were embedded directly in the checker script.
+      This meant an attacker who swapped the reconciler binary could also rewrite
+      the checker with matching expected hashes in the same operation.
+
+      By storing the baseline in a separate file (mode 0400, never rewritten by
+      the running service) an attacker must compromise two independent files to
+      defeat the check.  The checker reads its expected values from the baseline
+      at runtime rather than from hardcoded strings.
+    """
     try:
         expected_env_sha = fncSha256Sum(ENVFILE) if ENVFILE.exists() else ""
     except Exception:
@@ -796,17 +842,45 @@ def fncWriteChecker(expected_sha: str):
     except Exception:
         expected_key_sha = ""
 
+    # Compute hashes for per-service credential files (may not exist yet)
+    try:
+        expected_graph_sha = fncSha256Sum(GRAPH_ENVFILE) if GRAPH_ENVFILE.exists() else ""
+    except Exception:
+        expected_graph_sha = ""
+    try:
+        expected_pbs_sha = fncSha256Sum(PBS_ENVFILE) if PBS_ENVFILE.exists() else ""
+    except Exception:
+        expected_pbs_sha = ""
+    try:
+        expected_pdm_sha = fncSha256Sum(PDM_ENVFILE) if PDM_ENVFILE.exists() else ""
+    except Exception:
+        expected_pdm_sha = ""
+
+    # Write baseline file (separate from checker script)
+    _ensure_conf_dir()
+    baseline_content = (
+        f"script={expected_sha}\n"
+        f"env={expected_env_sha}\n"
+        f"key={expected_key_sha}\n"
+        f"graph_env={expected_graph_sha}\n"
+        f"pbs_env={expected_pbs_sha}\n"
+        f"pdm_env={expected_pdm_sha}\n"
+    )
+    BASELINE.write_text(baseline_content, encoding="utf-8")
+    os.chmod(BASELINE, 0o400)  # read-only by root; never rewritten by service
+    fncOk(f"Wrote baseline hash file: {BASELINE} (mode 0400)")
+
     checker_script = f"""#!/bin/bash
 set -euo pipefail
 
 SCRIPT="{SCRIPT_DST}"
 ENVFILE="{ENVFILE}"
 KEYFILE="{KEYFILE}"
+GRAPH_ENVFILE="{GRAPH_ENVFILE}"
+PBS_ENVFILE="{PBS_ENVFILE}"
+PDM_ENVFILE="{PDM_ENVFILE}"
+BASELINE="{BASELINE}"
 LOGFILE="{LOGDIR}/thelog.log"
-
-EXPECTED_SHA="{expected_sha}"
-EXPECTED_ENV_SHA="{expected_env_sha}"
-EXPECTED_KEY_SHA="{expected_key_sha}"
 
 # Write a timestamped line to the shared application log file so that the
 # reconciler's own log (and any SIEM monitoring it) captures integrity events.
@@ -830,6 +904,29 @@ fail() {{
     echo "$1" >&2
     exit 1
 }}
+
+# ── Baseline file checks ──────────────────────────────────────────────────
+# Read expected hashes from the separate baseline file (not from this script).
+# This means an attacker must tamper with TWO files to defeat the check.
+if [[ ! -e "$BASELINE" ]]; then
+    fail "Integrity: baseline file missing path=$BASELINE"
+fi
+if [[ -L "$BASELINE" ]]; then
+    fail "Integrity: baseline is a symlink path=$BASELINE"
+fi
+
+read_baseline() {{
+    local key="$1"
+    grep -E "^${{key}}=" "$BASELINE" 2>/dev/null | head -1 | cut -d= -f2-
+}}
+
+EXPECTED_SHA=$(read_baseline "script")
+EXPECTED_ENV_SHA=$(read_baseline "env")
+EXPECTED_KEY_SHA=$(read_baseline "key")
+
+if [[ -z "$EXPECTED_SHA" ]]; then
+    fail "Integrity: baseline missing 'script' entry path=$BASELINE"
+fi
 
 check_secure_file() {{
     local p="$1"
@@ -878,6 +975,36 @@ if [[ -e "$KEYFILE" && -n "$EXPECTED_KEY_SHA" ]]; then
     fi
 fi
 
+# ── Per-service credential file checks ───────────────────────────────────
+EXPECTED_GRAPH_SHA=$(read_baseline "graph_env")
+EXPECTED_PBS_SHA=$(read_baseline "pbs_env")
+EXPECTED_PDM_SHA=$(read_baseline "pdm_env")
+
+for cred_file in "$GRAPH_ENVFILE" "$PBS_ENVFILE" "$PDM_ENVFILE"; do
+    check_secure_file "$cred_file"
+done
+
+if [[ -e "$GRAPH_ENVFILE" && -n "$EXPECTED_GRAPH_SHA" ]]; then
+    ACTUAL_GRAPH_SHA=$(sha256_file "$GRAPH_ENVFILE")
+    if [[ "$ACTUAL_GRAPH_SHA" != "$EXPECTED_GRAPH_SHA" ]]; then
+        log_warn "Integrity: env checksum changed path=$GRAPH_ENVFILE have=$ACTUAL_GRAPH_SHA expect=$EXPECTED_GRAPH_SHA"
+    fi
+fi
+
+if [[ -e "$PBS_ENVFILE" && -n "$EXPECTED_PBS_SHA" ]]; then
+    ACTUAL_PBS_SHA=$(sha256_file "$PBS_ENVFILE")
+    if [[ "$ACTUAL_PBS_SHA" != "$EXPECTED_PBS_SHA" ]]; then
+        log_warn "Integrity: env checksum changed path=$PBS_ENVFILE have=$ACTUAL_PBS_SHA expect=$EXPECTED_PBS_SHA"
+    fi
+fi
+
+if [[ -e "$PDM_ENVFILE" && -n "$EXPECTED_PDM_SHA" ]]; then
+    ACTUAL_PDM_SHA=$(sha256_file "$PDM_ENVFILE")
+    if [[ "$ACTUAL_PDM_SHA" != "$EXPECTED_PDM_SHA" ]]; then
+        log_warn "Integrity: env checksum changed path=$PDM_ENVFILE have=$ACTUAL_PDM_SHA expect=$EXPECTED_PDM_SHA"
+    fi
+fi
+
 exit 0
 """
     CHECKER.write_text(checker_script)
@@ -892,8 +1019,14 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# Main config (no secrets)
 EnvironmentFile=-{ENVFILE}
+# Encryption key (Fernet)
 EnvironmentFile=-{KEYFILE}
+# Per-service credential files (secrets isolated by service)
+EnvironmentFile=-{GRAPH_ENVFILE}
+EnvironmentFile=-{PBS_ENVFILE}
+EnvironmentFile=-{PDM_ENVFILE}
 ExecCondition={CHECKER}
 ExecStart=/usr/bin/python3 {SCRIPT_DST}
 User=root
@@ -924,26 +1057,21 @@ def fncDoUninstall(purge: bool = False):
     fncRequireRoot()
     fncHeading("[*] Uninstalling Entramox Reconciler...")
 
-    # Stop & disable both new + legacy units (ignore failures)
-    units = [
-        (TIMER.name, SERVICE.name),
-        (LEGACY_TIMER.name, LEGACY_SERVICE.name),
-    ]
-    for timer_name, svc_name in units:
-        for unit in (timer_name, svc_name):
-            try:
-                fncRun(["systemctl", "stop", unit])
-                fncInfo(f"Stopped {unit}")
-            except subprocess.CalledProcessError:
-                fncWarn(f"{unit} was not running")
-            try:
-                fncRun(["systemctl", "disable", unit])
-                fncInfo(f"Disabled {unit}")
-            except subprocess.CalledProcessError:
-                fncWarn(f"{unit} was not enabled")
+    # Stop & disable units (ignore failures)
+    for unit in (TIMER.name, SERVICE.name):
+        try:
+            fncRun(["systemctl", "stop", unit])
+            fncInfo(f"Stopped {unit}")
+        except subprocess.CalledProcessError:
+            fncWarn(f"{unit} was not running")
+        try:
+            fncRun(["systemctl", "disable", unit])
+            fncInfo(f"Disabled {unit}")
+        except subprocess.CalledProcessError:
+            fncWarn(f"{unit} was not enabled")
 
-    # Remove unit files (new + legacy)
-    for p in (TIMER, SERVICE, LEGACY_TIMER, LEGACY_SERVICE):
+    # Remove unit files
+    for p in (TIMER, SERVICE):
         try:
             if p.exists():
                 p.unlink()
@@ -959,8 +1087,8 @@ def fncDoUninstall(purge: bool = False):
     except subprocess.CalledProcessError:
         fncWarn("Failed to reload systemd daemon")
 
-    # Remove installed script & checker (new + legacy)
-    for p in (SCRIPT_DST, CHECKER, LEGACY_SCRIPT_DST, LEGACY_CHECKER):
+    # Remove installed script & checker
+    for p in (SCRIPT_DST, CHECKER):
         try:
             if p.exists():
                 p.unlink()
@@ -970,32 +1098,22 @@ def fncDoUninstall(purge: bool = False):
         except Exception as e:
             fncWarn(f"Could not remove {p}: {e}")
 
-    # Remove logrotate snippets (new + legacy)
-    LOGROTATE_NEW = Path("/etc/logrotate.d/entramoxreconciler")
-    LOGROTATE_OLD = Path("/etc/logrotate.d/sudomatic5000")
-    for p in (LOGROTATE_NEW, LOGROTATE_OLD):
-        try:
-            if p.exists():
-                p.unlink()
-                fncOk(f"Removed {p}")
-            else:
-                fncInfo(f"Not present: {p}")
-        except Exception as e:
-            fncWarn(f"Could not remove {p}: {e}")
+    # Remove logrotate snippet
+    LOGROTATE = Path("/etc/logrotate.d/entramoxreconciler")
+    try:
+        if LOGROTATE.exists():
+            LOGROTATE.unlink()
+            fncOk(f"Removed {LOGROTATE}")
+    except Exception as e:
+        fncWarn(f"Could not remove {LOGROTATE}: {e}")
 
     # Optional removals
-    state_root_new = Path("/var/lib/entramoxreconciler")
-    state_root_old = Path("/var/lib/sudomatic5000")
-
     targets = [
-        ("env file (new)", ENVFILE),
-        ("key file (new)", KEYFILE),
-        ("log dir (new)", LOGDIR),
-        ("state dir (new)", state_root_new),
-        ("env file (legacy)", LEGACY_ENVFILE),
-        ("key file (legacy)", LEGACY_KEYFILE),
-        ("log dir (legacy)", LEGACY_LOGDIR),
-        ("state dir (legacy)", state_root_old),
+        ("env file",      ENVFILE),
+        ("key file",      KEYFILE),
+        ("conf dir",      CONF_DIR),
+        ("log dir",       LOGDIR),
+        ("state dir",     Path("/var/lib/entramoxreconciler")),
     ]
 
     def ask(q: str) -> bool:
@@ -1070,10 +1188,7 @@ def fncDoInstall():
 
 def fncDoUpdate(auto_restart: bool = False):
     fncRequireRoot()
-    fncHeading("[*] Updating Entramox Reconciler...]")
-
-    # First: adopt any legacy files if present
-    fncMaybeAdoptLegacyArtifacts()
+    fncHeading("[*] Updating Entramox Reconciler...")
 
     if not SCRIPT_DST.exists():
         fncErr("Installed script not found (new or adopted). Did you run install first?")
@@ -1147,15 +1262,7 @@ def fncDoUpdate(auto_restart: bool = False):
     fncRun(["systemctl", "daemon-reload"])
     fncOk("systemd daemon reloaded")
 
-    # Disable legacy timer if it's still around (best-effort)
-    for unit in (LEGACY_TIMER.name, LEGACY_SERVICE.name):
-        try:
-            fncRun(["systemctl", "disable", "--now", unit])
-            fncInfo(f"Disabled legacy unit: {unit}")
-        except subprocess.CalledProcessError:
-            pass
-
-    # Ensure new timer is enabled
+    # Ensure timer is enabled
     try:
         fncRun(["systemctl", "enable", "--now", TIMER.name])
         fncOk(f"Ensured timer enabled: {TIMER.name}")
@@ -1173,7 +1280,7 @@ def fncDoUpdate(auto_restart: bool = False):
 # Entry point
 # ============================
 def fncMain():
-    parser = argparse.ArgumentParser(description="Installer/Updater for Entramox Reconciler (with legacy Sudomatic migration)")
+    parser = argparse.ArgumentParser(description="Installer/Updater for Entramox Reconciler")
     parser.add_argument("action", choices=["install", "update", "uninstall"], help="Action to perform")
     parser.add_argument("--restart", action="store_true", help="Auto-restart service after update")
     parser.add_argument("--purge", action="store_true", help="Remove env, logs, and state without prompts (DANGEROUS)")

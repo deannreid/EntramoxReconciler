@@ -27,6 +27,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import time as _time_module
 from datetime import datetime, timedelta, timezone
 from urllib import parse as _urlparse, request as _urlreq
 from urllib.error import HTTPError, URLError
@@ -71,7 +72,7 @@ RESERVED_USERS = {
 }
 
 #------------------------------#
-# UPN → Unix mapping behaviour #
+# UPN > Unix mapping behaviour #
 #------------------------------#
 USERNAME_MODE = "useronly"          # "useronly" or "upn_concat"
 USERNAME_SEPARATOR = "_"            # Only used with "upn_concat"
@@ -141,14 +142,30 @@ PDM_VERIFY_TLS       = True
 #---------------------------#
 AUDIT_LOG = "/var/log/entramoxreconciler/audit.log"
 
+#-------------------------------------------#
+# Secret rotation / Fernet TTL enforcement  #
+#-------------------------------------------#
+# Fernet tokens older than this many days will be rejected outright.
+# Set to 0 to disable TTL enforcement (not recommended).
+FERNET_MAX_AGE_DAYS = 365
+
 #---------------------------------------------#
 # Microsoft Graph (client-credentials via env)#
 #---------------------------------------------#
 GRAPH_ENFORCE = True
-GRAPH_FAIL_OPEN = True
+GRAPH_FAIL_OPEN = True        # Legacy boolean; prefer GRAPH_FAIL_POLICY below
+GRAPH_FAIL_POLICY = "permissive"  # "permissive" (warn+continue) | "strict" (abort on Graph failure)
 
 GRAPH_GROUP_IDS = []    # Parsed below from ENTRA_* vars
 GRAPH_TIMEOUT = 8       # Seconds
+
+#----------------------------------------#
+# Safety limits                          #
+#----------------------------------------#
+# Maximum users that may be CREATED in a single run.
+# Prevents a compromised Entra group from mass-provisioning accounts.
+# Set to 0 to disable (not recommended in production).
+MAX_USERS_PER_RUN = 50
 
 # Token envs (bearer OR client creds)
 ENV_GRAPH_ACCESS_TOKEN = "GRAPH_ACCESS_TOKEN"
@@ -171,7 +188,13 @@ TOKEN_ENV_FALLBACKS = [
 _LOCK_FH = None
 
 def fncAcquireLock():
-    """Acquire an exclusive lock to prevent concurrent runs."""
+    """Acquire an exclusive lock to prevent concurrent runs.
+
+    Stale-lock protection: if the lock file is older than STALE_LOCK_SECONDS and
+    is not held by any process (LOCK_NB succeeds after removing it), we log a
+    warning and proceed.  This prevents permanent deadlock after a crash.
+    """
+    STALE_LOCK_SECONDS = 600  # 10 minutes - well above any normal run time
     os.makedirs(STATE_DIR, exist_ok=True)
     global _LOCK_FH
     try:
@@ -180,6 +203,28 @@ def fncAcquireLock():
         fcntl.lockf(_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
         logging.debug("Acquired lock: %s", LOCK_PATH)
     except BlockingIOError:
+        # Check if the existing lock is stale (process crashed without releasing)
+        try:
+            age = _get_utc_datetime().timestamp() - os.path.getmtime(LOCK_PATH)
+            if age > STALE_LOCK_SECONDS:
+                logging.warning(
+                    "Stale lock detected at %s (age=%.0fs > %ds); removing and retrying.",
+                    LOCK_PATH, age, STALE_LOCK_SECONDS
+                )
+                try:
+                    _LOCK_FH.close()
+                except Exception:
+                    pass
+                os.remove(LOCK_PATH)
+                _LOCK_FH = open(LOCK_PATH, "w")
+                os.chmod(LOCK_PATH, 0o600)
+                fcntl.lockf(_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                logging.info("Acquired lock after stale removal: %s", LOCK_PATH)
+                return
+        except BlockingIOError:
+            pass
+        except Exception as e:
+            logging.debug("Stale lock check error: %s", e)
         fncPrintMessage("Another instance of entramoxreconciler is already running.", "warning")
         sys.exit(1)
     except Exception as e:
@@ -235,9 +280,20 @@ def _env_json(name: str, default):
         logging.error("Bad JSON in %s: %s", name, e)
         return default
 
+# Function: _mask_upn
+# Purpose : Partially redact a UPN to avoid PII leakage in logs.
+# Notes   : Only applied to INFO-level log output; DEBUG may show full UPNs
+#           when LOGGING_LEVEL=DEBUG is explicitly set by the operator.
+def _mask_upn(upn: str, keep: int = 3) -> str:
+    if "@" not in upn:
+        return upn[:keep] + "***" if len(upn) > keep else upn
+    local, domain = upn.split("@", 1)
+    masked_local = local[:keep] + "***" if len(local) > keep else local
+    return f"{masked_local}@{domain}"
+
 # Function: _log_group_members
 # Purpose : Summarise group membership without persisting to disk.
-# Notes   : INFO shows counts + samples; DEBUG logs full lists.
+# Notes   : INFO shows counts + masked UPN samples; DEBUG logs full lists.
 def _log_group_members(name: str, purpose: str, upns: set[str] | None, sample: int = 20):
     if upns is None:
         logging.info("Graph group '%s' (%s): fetch failed (fail-open)", name, purpose)
@@ -247,15 +303,15 @@ def _log_group_members(name: str, purpose: str, upns: set[str] | None, sample: i
     upn_list = sorted(upns)
     unix_list = sorted({fncUpnToUnix(u) for u in upns})
 
-    # INFO: count + small samples
-    info_upn_sample = upn_list[:sample]
-    info_unix_sample = unix_list[:sample]
+    # INFO: count + small masked samples (no PII in prod logs)
+    masked_upn_sample = [_mask_upn(u) for u in upn_list[:sample]]
+    info_unix_sample  = unix_list[:sample]
     logging.info(
         "Graph group '%s' (%s): members=%d | unix_sample=%s | upn_sample=%s",
-        name, purpose, count, info_unix_sample, info_upn_sample
+        name, purpose, count, info_unix_sample, masked_upn_sample
     )
 
-    # DEBUG: full lists
+    # DEBUG: full unmasked lists (only emitted when operator sets DEBUG logging)
     logging.debug("Graph group '%s' (%s) FULL unix=%s", name, purpose, unix_list)
     logging.debug("Graph group '%s' (%s) FULL upn =%s", name, purpose, upn_list)
 
@@ -306,6 +362,46 @@ def _safe_write_atomic(path: str, data: str, mode: int = 0o600):
     except FileNotFoundError:
         pass
     os.replace(tmp, path)
+
+def _http_with_retry(req, timeout: int, context=None, max_retries: int = 3, label: str = ""):
+    """Open an HTTP request with exponential backoff retry.
+
+    Retries on transient network/server errors (URLError, 5xx).
+    Does NOT retry 4xx responses (auth/client errors are permanent).
+    Returns the response object on success, raises on final failure.
+
+    Backoff: 1s, 2s, 4s between attempts (capped at max_retries total calls).
+    """
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return _urlreq.urlopen(req, timeout=timeout, context=context)
+        except HTTPError as e:
+            if 400 <= e.code < 500:
+                raise  # Client errors are permanent; do not retry
+            last_exc = e
+            if attempt < max_retries:
+                wait = 2 ** (attempt - 1)
+                logging.warning(
+                    "HTTP %s on attempt %d/%d%s; retrying in %ds",
+                    e.code, attempt, max_retries,
+                    f" [{label}]" if label else "", wait
+                )
+                _time_module.sleep(wait)
+        except URLError as e:
+            last_exc = e
+            if attempt < max_retries:
+                wait = 2 ** (attempt - 1)
+                logging.warning(
+                    "Network error on attempt %d/%d%s: %s; retrying in %ds",
+                    attempt, max_retries,
+                    f" [{label}]" if label else "", e, wait
+                )
+                _time_module.sleep(wait)
+        except Exception:
+            raise
+    raise last_exc  # type: ignore[misc]
+
 
 def _allowed_domain(dom: str) -> bool:
     dom = (dom or "").lower()
@@ -421,19 +517,20 @@ def _lookupUserMeta(upn: str, groups: list[dict]) -> dict:
     return best
 
 def _graphFailOrWarn(message: str):
-    """
-    Enforce GRAPH_FAIL_OPEN policy.
-    If fail-open: warn and continue.
-    If fail-closed: log + print and exit non-zero.
-    """
-    if GRAPH_FAIL_OPEN:
-        logging.warning(message)
-        fncPrintMessage(message, "warning")
-        return
+    """Enforce GRAPH_FAIL_POLICY.
 
-    logging.error(message)
-    fncPrintMessage(message, "error")
-    sys.exit(2)
+    permissive: warn and continue using stale state (legacy default).
+    strict:     abort the run - stale state must NOT be trusted when Graph
+                is unreachable, as group removals would not be detected.
+    """
+    if GRAPH_FAIL_POLICY == "strict":
+        logging.error("GRAPH_FAIL_POLICY=strict: %s - aborting run.", message)
+        fncPrintMessage(f"[strict] {message}", "error")
+        fncAuditEvent("GRAPH_STRICT_ABORT", {"reason": message})
+        sys.exit(2)
+
+    logging.warning("GRAPH_FAIL_POLICY=permissive: %s - continuing with stale state.", message)
+    fncPrintMessage(message, "warning")
 
 def _buildPveMetaForUpn(upn: str, groups: list[dict]) -> tuple[dict, str]:
     """
@@ -520,6 +617,22 @@ ALLOWED_UPN_DOMAINS = _env_set("ALLOWED_UPN_DOMAINS", ALLOWED_UPN_DOMAINS)
 GRAPH_ENFORCE   = _env_bool("GRAPH_ENFORCE", GRAPH_ENFORCE)
 GRAPH_FAIL_OPEN = _env_bool("GRAPH_FAIL_OPEN", GRAPH_FAIL_OPEN)
 
+# GRAPH_FAIL_POLICY overrides the legacy GRAPH_FAIL_OPEN boolean.
+# "strict"     > abort run if Graph is unreachable or returns empty data
+# "permissive" > warn and continue using stale state (legacy default)
+_gfp = os.getenv("GRAPH_FAIL_POLICY", "").strip().lower()
+if _gfp in ("strict", "permissive"):
+    GRAPH_FAIL_POLICY = _gfp
+    GRAPH_FAIL_OPEN   = (_gfp == "permissive")
+else:
+    # Back-derive policy from the legacy boolean for backwards compatibility
+    GRAPH_FAIL_POLICY = "permissive" if GRAPH_FAIL_OPEN else "strict"
+
+# Safety cap on user creation per run
+_mup = os.getenv("MAX_USERS_PER_RUN", "").strip()
+if _mup and _mup.isdigit():
+    MAX_USERS_PER_RUN = int(_mup)
+
 # Multi-group inputs
 GRAPH_GROUP_IDS = _env_list("ENTRA_GROUP_IDS", [])
 ENTRA_ROLE_MAP  = _env_json("ENTRA_ROLE_MAP", [])
@@ -574,7 +687,12 @@ PDM_DEFAULT_ROLE    = _env_str ("PDM_DEFAULT_ROLE",    PDM_DEFAULT_ROLE)
 PDM_ADMIN_ROLE      = _env_str ("PDM_ADMIN_ROLE",      PDM_ADMIN_ROLE)
 PDM_VERIFY_TLS      = _env_bool("PDM_VERIFY_TLS",      PDM_VERIFY_TLS)
 
-# Map group → PVE role (only non-empty)
+# Fernet secret rotation enforcement
+_fernet_age = os.getenv("FERNET_MAX_AGE_DAYS", "").strip()
+if _fernet_age and _fernet_age.isdigit():
+    FERNET_MAX_AGE_DAYS = int(_fernet_age)
+
+# Map group > PVE role (only non-empty)
 PVE_ROLE_BY_GROUP = {
     (m.get("group") or "").strip(): (m.get("pve_role") or "")
     for m in (ENTRA_ROLE_MAP or [])
@@ -618,11 +736,22 @@ def fncScriptSecurityCheck():
 # Function: fncBootstrapPaths
 # Purpose : Create required directories and apply conservative permissions.
 # Notes   : Safe to call multiple times; no-op when present.
+#           Audit log created 0640 (root:adm) so local users cannot read
+#           provisioning events but the adm group can forward them to SIEM.
 def fncBootstrapPaths():
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    log_dir = os.path.dirname(LOG_FILE)
+    os.makedirs(log_dir, exist_ok=True)
     os.makedirs(STATE_DIR, exist_ok=True)
-    os.chmod(os.path.dirname(LOG_FILE), 0o750)
+    os.chmod(log_dir, 0o750)
     os.chmod(STATE_DIR, 0o750)
+    # Pre-create the audit log with strict permissions so the first fncAuditEvent()
+    # call inherits 0640 rather than the process umask.
+    if not os.path.exists(AUDIT_LOG):
+        try:
+            fd = os.open(AUDIT_LOG, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o640)
+            os.close(fd)
+        except Exception as e:
+            logging.warning("Could not pre-create audit log %s: %s", AUDIT_LOG, e)
 
 # Function: fncEnsureLogrotate
 # Purpose : Drop a logrotate file so the log doesn't grow to wales.
@@ -657,7 +786,22 @@ def fncSetupLogging():
         handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
     )
     logging.info("---- Script start ----")
+    logging.info(
+        "Security policy: GRAPH_FAIL_POLICY=%s MAX_USERS_PER_RUN=%s FERNET_MAX_AGE_DAYS=%s",
+        GRAPH_FAIL_POLICY,
+        str(MAX_USERS_PER_RUN) if MAX_USERS_PER_RUN else "unlimited",
+        FERNET_MAX_AGE_DAYS,
+    )
     fncEnsureLogrotate()
+    # Warn at startup if TLS verification is disabled for any remote system
+    if PBS_ENABLED and not PBS_VERIFY_TLS:
+        msg = "TLS verification disabled for PBS (PBS_VERIFY_TLS=false) - MITM risk"
+        logging.warning(msg)
+        fncAuditEvent("TLS_DISABLED", {"system": "PBS", "host": PBS_HOST})
+    if PDM_ENABLED and not PDM_VERIFY_TLS:
+        msg = "TLS verification disabled for PDM (PDM_VERIFY_TLS=false) - MITM risk"
+        logging.warning(msg)
+        fncAuditEvent("TLS_DISABLED", {"system": "PDM", "host": PDM_HOST})
 
 # Function: fncAuditEvent
 # Purpose : Write a structured security audit event to the audit log (JSON-lines format).
@@ -959,6 +1103,7 @@ def fncEnsureUserGroup(user: str, group: str, present: bool) -> bool:
             logging.error("Failed to remove %s from group %s: %s", user, group, err)
             return False
         logging.info("Removed %s from group %s", user, group)
+        fncAuditEvent("GROUP_REMOVED", {"user": user, "group": group})
         return True
     return False
 
@@ -1055,6 +1200,7 @@ def fncDeleteUser(user: str):
         logging.error("Failed to delete user %s: %s", user, err)
     else:
         logging.info("Deleted user (and home): %s", user)
+        fncAuditEvent("USER_DELETED", {"user": user})
 
 # Function: fncGrantSudo
 # Purpose : Ensure a per-user sudoers file exists with desired NOPASSWD policy.
@@ -1093,6 +1239,7 @@ def fncGrantSudo(user: str) -> bool:
     _assert_regular_or_missing(path)
     os.replace(tmp, path)
     logging.info("Updated sudoers for %s at %s", user, path)
+    fncAuditEvent("SUDO_GRANTED", {"user": user, "path": path})
     return True
 
 # Function: fncRemoveSudoers
@@ -1104,6 +1251,7 @@ def fncRemoveSudoers(user: str):
         if os.path.exists(path):
             os.remove(path)
             logging.info("Removed sudoers file for %s", user)
+            fncAuditEvent("SUDO_REVOKED", {"user": user, "path": path})
     except Exception as e:
         logging.error("Failed removing sudoers for %s: %s", user, e)
 
@@ -1131,20 +1279,31 @@ def fncSetInitialPassword(user: str) -> bool:
 
 # Function: fncLoadState
 # Purpose : Load persistent state (known + disabled users + tiered accounts).
-# Notes   : Returns defaults on error or missing file.
+# Notes   : Returns defaults when file is absent.
+#           ABORTS (CRITICAL) when the file exists but cannot be parsed - a corrupt
+#           state file must be investigated rather than silently discarded, because
+#           doing so could cause mass re-provisioning or missed deletions.
 def fncLoadState() -> dict:
     defaults = {"known_users": [], "disabled": {}, "tiered_users": []}
     if not os.path.exists(STATE_PATH):
         return defaults
     try:
-        with open(STATE_PATH, "r") as f:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         # Back-fill any keys missing from older state files
         for k, v in defaults.items():
             data.setdefault(k, v)
         return data
-    except Exception:
-        return defaults
+    except json.JSONDecodeError as e:
+        logging.critical(
+            "State file %s is corrupt and cannot be parsed: %s - "
+            "repair or remove the file before restarting. Aborting to avoid data loss.",
+            STATE_PATH, e
+        )
+        sys.exit(3)
+    except Exception as e:
+        logging.critical("Failed to read state file %s: %s - aborting.", STATE_PATH, e)
+        sys.exit(3)
 
 # Function: fncSaveState
 # Purpose : Persist state atomically with safe perms.
@@ -1260,22 +1419,70 @@ def fncPveEnsureAclRoles(userid: str, roles: set[str], path: str = "/") -> None:
 #              Remote API client (PBS / PDM shared)               #
 #==================================================================#
 
-def _fncDecryptTokenValue(enc_value: str) -> str | None:
-    """Decrypt a Fernet-encrypted API token value using the key file."""
+def _fncDecryptTokenValue(enc_value: str, label: str = "remote API token") -> str:
+    """Decrypt a Fernet-encrypted API token value using the key file.
+
+    Security notes:
+    - Decryption failure is FATAL: falling back to plaintext would silently
+      degrade security and may expose credentials (e.g. if key file removed).
+    - Fernet tokens embed a timestamp; we enforce FERNET_MAX_AGE_DAYS so that
+      tokens encrypted very long ago are rejected.
+    - A near-expiry warning is emitted when less than 30 days remain.
+    """
     if not enc_value:
-        return None
-    if enc_value.startswith("fernet:"):
-        from cryptography.fernet import Fernet
-        key_b64 = os.getenv("ENTRAMOX_ENC_KEY", "").strip()
-        if not key_b64:
-            logging.error("Missing ENTRAMOX_ENC_KEY to decrypt remote API token")
-            return None
-        try:
-            return Fernet(key_b64.encode()).decrypt(enc_value.split(":", 1)[1].encode()).decode()
-        except Exception as e:
-            logging.error("Failed to decrypt remote API token: %s", e)
-            return None
-    return enc_value  # plaintext fallback
+        logging.critical("Empty encrypted value for %s; aborting.", label)
+        sys.exit(2)
+    if not enc_value.startswith("fernet:"):
+        # Plaintext value - acceptable only if not prefixed; still usable but warn
+        logging.warning(
+            "%s is stored as plaintext (not Fernet-encrypted). "
+            "Re-run the installer to encrypt secrets.", label
+        )
+        return enc_value
+
+    from cryptography.fernet import Fernet, InvalidToken
+    import struct, base64, time as _time
+
+    key_b64 = os.getenv("ENTRAMOX_ENC_KEY", "").strip()
+    if not key_b64:
+        logging.critical(
+            "Missing ENTRAMOX_ENC_KEY needed to decrypt %s - "
+            "service cannot start without the encryption key. Aborting.", label
+        )
+        sys.exit(2)
+
+    raw_token = enc_value.split(":", 1)[1].encode()
+    max_age_seconds = FERNET_MAX_AGE_DAYS * 86400
+    warn_threshold  = max_age_seconds - (30 * 86400)  # 30-day warning window
+
+    # Check token age before decrypting for near-expiry warning
+    try:
+        padded = raw_token + b"=" * (-len(raw_token) % 4)
+        decoded = base64.urlsafe_b64decode(padded)
+        if len(decoded) >= 9:
+            token_ts = struct.unpack(">Q", decoded[1:9])[0]
+            age = int(_time.time()) - token_ts
+            if age > warn_threshold:
+                days_left = max(0, (max_age_seconds - age) // 86400)
+                logging.warning(
+                    "%s Fernet token is %d days old; %d days until forced rotation. "
+                    "Re-encrypt secrets via the installer.", label, age // 86400, days_left
+                )
+    except Exception:
+        pass  # timestamp decode is best-effort; don't block on it
+
+    try:
+        return Fernet(key_b64.encode()).decrypt(raw_token, ttl=max_age_seconds).decode()
+    except InvalidToken:
+        logging.critical(
+            "Failed to decrypt %s - token is invalid, corrupted, or older than "
+            "%d days (FERNET_MAX_AGE_DAYS). Re-encrypt via the installer. Aborting.",
+            label, FERNET_MAX_AGE_DAYS
+        )
+        sys.exit(2)
+    except Exception as e:
+        logging.critical("Unexpected error decrypting %s: %s - aborting.", label, e)
+        sys.exit(2)
 
 
 def _fncRemoteApiRequest(
@@ -1308,9 +1515,14 @@ def _fncRemoteApiRequest(
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+        logging.warning(
+            "TLS certificate verification DISABLED for %s %s - "
+            "connection is vulnerable to MITM. Set verify_tls=true in production.",
+            method, url
+        )
 
     try:
-        with _urlreq.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with _http_with_retry(req, timeout, context=ctx, label=f"{method} {path}") as resp:
             return json.loads(resp.read().decode())
     except HTTPError as e:
         try:
@@ -1547,26 +1759,24 @@ def fncPdmUserSetEnabled(upn: str, enabled: bool) -> bool:
 # Purpose : Resolve MS Entra client secret from env (plaintext or Fernet-encrypted).
 # Notes   : Supports ENTR_CLNT_SEC (plain) or ENTR_CLNT_SEC_ENC="fernet:<token>" with ENTRAMOX_ENC_KEY.
 def fncGetGraphClientSecret() -> str | None:
-    from cryptography.fernet import Fernet
+    """Return the Graph client secret.
+
+    Prefers ENTR_CLNT_SEC_ENC (Fernet-encrypted) over ENTR_CLNT_SEC (plaintext).
+    Decryption failure is fatal - see _fncDecryptTokenValue for rationale.
+    """
+    enc = os.getenv("ENTR_CLNT_SEC_ENC", "").strip()
+    if enc:
+        # Delegates fatal handling and TTL enforcement to _fncDecryptTokenValue
+        return _fncDecryptTokenValue(enc, label="Graph client secret (ENTR_CLNT_SEC_ENC)")
 
     plain = os.getenv("ENTR_CLNT_SEC", "").strip()
     if plain:
+        logging.warning(
+            "Graph client secret is stored as plaintext (ENTR_CLNT_SEC). "
+            "Re-run the installer to encrypt it."
+        )
         return plain
-    
-    enc = os.getenv("ENTR_CLNT_SEC_ENC", "").strip()
-    if enc.startswith("fernet:"):
-        key_b64 = os.getenv("ENTRAMOX_ENC_KEY", "").strip()
-        if not key_b64:
-            logging.error("Missing ENTRAMOX_ENC_KEY for decrypting ENTR_CLNT_SEC_ENC")
-            return None
-        try:
-            token = enc.split(":", 1)[1]
-            return Fernet(key_b64.encode()).decrypt(token.encode()).decode()
-        except Exception as e:
-            logging.error("Failed to decrypt ENTR_CLNT_SEC_ENC: %s", e)
-            return None
-    if enc:
-        logging.error("Unknown ENTR_CLNT_SEC_ENC format (expected 'fernet:...').")
+
     return None
 
 # Function: fncGraphGetToken
@@ -1601,7 +1811,7 @@ def fncGraphGetToken() -> str | None:
     }).encode()
     req = _urlreq.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
-        with _urlreq.urlopen(req, timeout=GRAPH_TIMEOUT) as resp:
+        with _http_with_retry(req, GRAPH_TIMEOUT, label="Graph token") as resp:
             body = json.loads(resp.read().decode())
             tok = body.get("access_token")
             if tok:
@@ -1656,7 +1866,7 @@ def _graphAuthHeaders(token: str, client_request_id: str | None = None) -> dict:
 def _graphFetchJson(url: str, headers: dict, client_req_id: str, context: str) -> dict | None:
     try:
         req = _urlreq.Request(url, headers=headers)
-        with _urlreq.urlopen(req, timeout=GRAPH_TIMEOUT) as resp:
+        with _http_with_retry(req, GRAPH_TIMEOUT, label=context) as resp:
             return json.loads(resp.read().decode())
     except HTTPError as e:
         rid = e.headers.get("request-id") or e.headers.get("x-ms-request-id")
@@ -2016,6 +2226,22 @@ def fncSync():
         disabled.pop(tiered_user, None)
         tiered_known.discard(tiered_user)
 
+    # ── Safety cap: abort if too many new accounts would be created ───────────
+    if MAX_USERS_PER_RUN > 0:
+        to_create = {u for u in desired_unix if u not in known and u not in RESERVED_USERS and not fncUserExists(u)}
+        if len(to_create) > MAX_USERS_PER_RUN:
+            msg = (
+                f"MAX_USERS_PER_RUN exceeded: {len(to_create)} accounts would be created "
+                f"(limit={MAX_USERS_PER_RUN}). Possible compromised Entra group. "
+                "Increase MAX_USERS_PER_RUN or investigate before re-running."
+            )
+            logging.critical(msg)
+            fncAuditEvent("MAX_USERS_EXCEEDED", {
+                "would_create": len(to_create),
+                "limit": MAX_USERS_PER_RUN,
+            })
+            sys.exit(4)
+
     # ── 2) Ensure/Create: users in allowed groups ──────────────────────────────
     for user in sorted(desired_unix):
         if user in RESERVED_USERS:
@@ -2093,8 +2319,7 @@ def fncSync():
             else:
                 fncAddUserToGroups(user, ["sudo"])
                 if GRANT_SUDO:
-                    fncGrantSudo(user)
-                fncAuditEvent("SUDO_GRANTED", {"user": user})
+                    fncGrantSudo(user)  # fncGrantSudo emits SUDO_GRANTED audit event
         else:
             fncRemoveSudoers(user)
             fncRemoveUserFromGroup(user, "sudo")

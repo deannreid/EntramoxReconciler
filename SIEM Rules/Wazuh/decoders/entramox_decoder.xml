@@ -365,6 +365,13 @@
   <order>path</order>
 </decoder>
 
+<!-- Baseline hash file missing or is a symlink (v2.5+) -->
+<decoder name="entramox-checker-baseline-missing">
+  <parent>entramox-checker</parent>
+  <regex>^Integrity: baseline (file missing|is a symlink) path=(.+)$</regex>
+  <order>check_type, path</order>
+</decoder>
+
 <!-- Env file checksum changed (warn — could be intentional reconfigure) -->
 <decoder name="entramox-checker-env-changed">
   <parent>entramox-checker</parent>

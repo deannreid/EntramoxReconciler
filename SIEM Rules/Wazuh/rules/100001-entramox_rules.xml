@@ -435,9 +435,18 @@
     <group>entramox,integrity,misconfig,</group>
   </rule>
 
+  <!-- Baseline hash file missing or symlink — defeats the entire integrity check -->
+  <rule id="2838" level="14">
+    <decoded_as>entramox-checker-baseline-missing</decoded_as>
+    <description>Entramox Integrity: baseline hash file $(check_type) — integrity check defeated ($(path))</description>
+    <mitre><id>T1574</id><id>T1195</id></mitre>
+    <group>entramox,integrity,tampering,</group>
+  </rule>
+
   <!-- Composite: multiple integrity failures in same run (escalation) -->
+  <!-- Uses if_matched_group because Wazuh if_matched_sid only accepts a single SID -->
   <rule id="2837" level="14" frequency="2" timeframe="60">
-    <if_matched_sid>2831,2832,2833</if_matched_sid>
+    <if_matched_group>entramox,integrity,tampering,</if_matched_group>
     <description>Entramox Integrity: multiple file tampering indicators detected in 60s — possible active attack</description>
     <mitre><id>T1574</id></mitre>
     <group>entramox,integrity,tampering,</group>
